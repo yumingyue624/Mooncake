@@ -33,6 +33,7 @@ tl::expected<void, ErrorCode> Client::InitKvClient(
 
 tl::expected<void, ErrorCode> Client::SetKvClient(
     std::shared_ptr<kv::KvClient> client) {
+    if (std::atomic_load(&kv_client_) == client) return {};
     auto io = MakeKvClientIO(client, tenant_id());
     if (client && !io) return tl::unexpected(ErrorCode::NOT_SUPPORTED);
     std::atomic_store(&kv_io_, std::move(io));

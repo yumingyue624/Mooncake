@@ -1427,6 +1427,20 @@ tl::expected<void, ErrorCode> Client::Get(const std::string& object_key,
         err = TransferRead(replica, slices);
     }
 
+    if (err != ErrorCode::OK && !replica.is_kv_replica()) {
+        auto io = std::atomic_load(&kv_io_);
+        if (io) {
+            auto current = Query(object_key);
+            if (current)
+                for (const auto& candidate : current->replicas) {
+                    if (!candidate.is_kv_replica()) continue;
+                    err = io->Read(object_key, candidate.get_kv_descriptor(),
+                                   slices);
+                    break;
+                }
+        }
+    }
+
     // Release the cache block after transfer completes (memcpy is done)
     if (hot_cache_ && cache_used) {
         hot_cache_->ReleaseHotKey(object_key);
@@ -1930,6 +1944,28 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
                     ShouldAdmitToHotCache(key, cache_used)) {
                     ProcessSlicesAsync(key, slices_it->second, stored_replica);
                 }
+            }
+        }
+    }
+
+    if (auto io = std::atomic_load(&kv_io_)) {
+        for (size_t i = 0; i < object_keys.size(); ++i) {
+            if (results[i]) continue;
+            auto destination = slices.find(object_keys[i]);
+            if (destination == slices.end()) continue;
+            auto current = Query(object_keys[i]);
+            if (!current) continue;
+            for (const auto& candidate : current->replicas) {
+                if (!candidate.is_kv_replica()) continue;
+                const auto error =
+                    io->Read(object_keys[i], candidate.get_kv_descriptor(),
+                             destination->second);
+                if (error == ErrorCode::OK)
+                    results[i] = VerifyObjectChecksum(
+                        object_keys[i], destination->second,
+                        candidate.get_kv_descriptor().object_size,
+                        query_results[i].object_checksum);
+                break;
             }
         }
     }

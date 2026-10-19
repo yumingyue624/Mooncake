@@ -2,6 +2,8 @@
 #include <kv_client.h>
 
 #include <cstring>
+#include <algorithm>
+#include <cstdlib>
 #include <functional>
 #include <map>
 #include <mutex>
@@ -64,6 +66,7 @@ class FakeSdk : public kv::KvClient {
     kv::Status BatchStoreAsync(const std::vector<kv::KVBuffer>& entries,
                                kv::TaskId& task) override {
         ++stores;
+        if (on_store_submit) on_store_submit();
         return Submit(entries, task, false);
     }
     kv::Status BatchLoadAsync(const std::vector<kv::KVBuffer>& entries,
@@ -118,6 +121,8 @@ class FakeSdk : public kv::KvClient {
         return kv::Status::OK();
     }
     bool fail_store = false;
+    size_t fail_on_store = 0;
+    std::function<void()> on_store_submit;
     size_t stores = 0;
 
    private:
@@ -135,7 +140,7 @@ class FakeSdk : public kv::KvClient {
     }
     kv::Status Submit(const std::vector<kv::KVBuffer>& entries,
                       kv::TaskId& task, bool read) {
-        return Schedule(task, [this, entries, read] {
+        return Schedule(task, [this, entries, read, store_number = stores] {
             kv::TaskResult result;
             std::lock_guard<std::mutex> lock(state_->mutex);
             for (const auto& entry : entries) {
@@ -146,7 +151,9 @@ class FakeSdk : public kv::KvClient {
                     status =
                         kv::Status::Error(kv::StatusCode::BUFFER_NOT_REGISTERED,
                                           "released before completion");
-                else if (!read && fail_store)
+                else if (!read &&
+                         (fail_store ||
+                          (fail_on_store && store_number == fail_on_store)))
                     status = kv::Status::Error(kv::StatusCode::IO_ERROR,
                                                "injected store failure");
                 else if (read && stored == state_->objects.end())
@@ -298,6 +305,47 @@ TEST_F(KvDualWriteTest,
     EXPECT_TRUE(state->objects.empty());
     ASSERT_TRUE(writer->Put("immutable", slices, {}));
     EXPECT_NE(Info("immutable").generation, first.generation);
+}
+
+TEST_F(KvDualWriteTest, BatchPreservesPartialFailures) {
+    sdk->fail_on_store = 2;
+    std::vector<std::vector<Slice>> batch{Slices(), Slices()};
+    auto results = writer->BatchPut({"partial/a", "partial/b"}, batch, {});
+    ASSERT_EQ(results.size(), 2);
+    EXPECT_TRUE(results[0]);
+    EXPECT_FALSE(results[1]);
+    EXPECT_TRUE(writer->Query("partial/a"));
+    EXPECT_FALSE(writer->Query("partial/b"));
+}
+
+TEST_F(KvDualWriteTest, MemoryAllocationFailureDoesNotPublishAnAsuOnlyWrite) {
+    ASSERT_TRUE(provider->UnmountSegment(segment, segment_size));
+    auto slices = Slices();
+    EXPECT_FALSE(writer->Put("memory-failed", slices, {}));
+    EXPECT_FALSE(writer->Query("memory-failed"));
+    EXPECT_EQ(sdk->stores, 0);
+    EXPECT_TRUE(state->objects.empty());
+}
+
+TEST_F(KvDualWriteTest, CorruptionIsDetectedBeforeCopyingToUserBuffer) {
+    auto slices = Slices();
+    ASSERT_TRUE(writer->Put("corrupt", slices, {}));
+    auto query = writer->Query("corrupt");
+    ASSERT_TRUE(query);
+    auto replica =
+        std::find_if(query->replicas.begin(), query->replicas.end(),
+                     [](const auto& r) { return r.is_kv_replica(); });
+    ASSERT_NE(replica, query->replicas.end());
+    QueryResult asu_only({*replica}, query->lease_timeout,
+                         query->object_checksum);
+    ASSERT_EQ(state->objects.size(), 1);
+    state->objects.begin()->second[512] ^= 1;
+    std::vector<char> output(1024, 0);
+    std::vector<Slice> destination{{output.data(), output.size()}};
+    auto result = reader->Get("corrupt", asu_only, destination);
+    ASSERT_FALSE(result);
+    EXPECT_EQ(result.error(), ErrorCode::CHECKSUM_MISMATCH);
+    EXPECT_EQ(output[0], 0);
 }
 
 TEST_F(KvDualWriteTest, RejectsMutableAndUnenumerableOperations) {
