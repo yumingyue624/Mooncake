@@ -330,6 +330,8 @@ class MasterClient {
      * @param force If true, skip lease and replication task checks
      * @return tl::expected<void, ErrorCode> indicating success/failure
      */
+    tl::expected<std::vector<KvObjectInfo>, ErrorCode> RemoveWithKvReplicas(
+        const std::string& key, bool force = false);
     [[nodiscard]] tl::expected<void, ErrorCode> Remove(const std::string& key,
                                                        bool force = false);
 

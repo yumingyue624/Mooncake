@@ -99,6 +99,7 @@ set(MOONCAKE_STORE_MASTER_SOURCES
 
 set(MOONCAKE_STORE_CLIENT_SOURCES
     client_kvclient.cpp
+    kv_client_io.cpp
     common/client_buffer_allocation.cpp
     mmap_arena.cpp
     config/hugepage_config.cpp

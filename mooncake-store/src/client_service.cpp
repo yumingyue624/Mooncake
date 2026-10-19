@@ -263,6 +263,9 @@ struct ReplicaTransferSummary {
     size_t allocated_memory_replicas = 0;
     size_t allocated_nof_replicas = 0;
     size_t allocated_dfs_replicas = 0;
+    size_t allocated_kv_replicas = 0;
+    size_t successful_kv_transfers = 0;
+    size_t failed_kv_transfers = 0;
     size_t successful_memory_transfers = 0;
     size_t successful_nof_transfers = 0;
     size_t successful_dfs_transfers = 0;
@@ -278,6 +281,8 @@ struct ReplicaTransferSummary {
             ++allocated_nof_replicas;
         } else if (replica.is_dfs_replica()) {
             ++allocated_dfs_replicas;
+        } else if (replica.is_kv_replica()) {
+            ++allocated_kv_replicas;
         }
     }
 
@@ -288,6 +293,8 @@ struct ReplicaTransferSummary {
             ++successful_nof_transfers;
         } else if (replica_type == ReplicaType::DFS) {
             ++successful_dfs_transfers;
+        } else if (replica_type == ReplicaType::KVCLIENT) {
+            ++successful_kv_transfers;
         }
     }
 
@@ -298,6 +305,8 @@ struct ReplicaTransferSummary {
             ++failed_nof_transfers;
         } else if (replica_type == ReplicaType::DFS) {
             ++failed_dfs_transfers;
+        } else if (replica_type == ReplicaType::KVCLIENT) {
+            ++failed_kv_transfers;
         }
         if (first_error == ErrorCode::OK) {
             first_error = error;
@@ -314,14 +323,17 @@ bool NonDfsTransfersSucceeded(const ReplicaTransferSummary& summary) {
 }
 
 bool AllAllocatedTransfersSucceeded(const ReplicaTransferSummary& summary) {
-    return NonDfsTransfersSucceeded(summary) &&
+    return summary.successful_kv_transfers == summary.allocated_kv_replicas &&
+           summary.failed_kv_transfers == 0 &&
+           NonDfsTransfersSucceeded(summary) &&
            summary.successful_dfs_transfers == summary.allocated_dfs_replicas &&
            summary.failed_dfs_transfers == 0;
 }
 
 bool HasExpectedReplicaAllocation(const ReplicateConfig& config,
                                   const ReplicaTransferSummary& summary) {
-    if (config.nof_replica_num == 0 && config.dfs_replica_num == 0) {
+    if (config.nof_replica_num == 0 && config.dfs_replica_num == 0 &&
+        config.kv_replica_num == 0) {
         return summary.allocated_memory_replicas > 0;
     }
     if (DetermineReplicaWriteMode(config) ==
@@ -332,7 +344,8 @@ bool HasExpectedReplicaAllocation(const ReplicateConfig& config,
     }
     return summary.allocated_memory_replicas == config.replica_num &&
            summary.allocated_nof_replicas == config.nof_replica_num &&
-           summary.allocated_dfs_replicas == config.dfs_replica_num;
+           summary.allocated_dfs_replicas == config.dfs_replica_num &&
+           summary.allocated_kv_replicas == config.kv_replica_num;
 }
 
 std::optional<ErrorCode> ValidatePreferSameNodeWriteConfig(
@@ -1058,6 +1071,11 @@ std::optional<std::shared_ptr<Client>> Client::Create(
     auto client = std::shared_ptr<Client>(new Client(
         local_hostname, resolved_metadata, protocol, labels, tenant_id));
 
+    if (const char* path = std::getenv("MOONCAKE_KVCLIENT_CONFIG");
+        path && *path) {
+        if (!client->InitKvClient(path)) return std::nullopt;
+    }
+
     ErrorCode err = client->ConnectToMaster(master_server_entry);
     if (err != ErrorCode::OK) {
         return std::nullopt;
@@ -1399,7 +1417,11 @@ tl::expected<void, ErrorCode> Client::Get(const std::string& object_key,
     }
 
     auto t0_get = std::chrono::steady_clock::now();
-    if (replica.is_dfs_replica()) {
+    if (replica.is_kv_replica()) {
+        auto io = std::atomic_load(&kv_io_);
+        err = io ? io->Read(object_key, replica.get_kv_descriptor(), slices)
+                 : ErrorCode::NOT_SUPPORTED;
+    } else if (replica.is_dfs_replica()) {
         err = ReadDfsReplica(object_key, replica, slices);
     } else {
         err = TransferRead(replica, slices);
@@ -1743,7 +1765,17 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
 
         // Submit transfer operation asynchronously
         std::optional<TransferFuture> future;
-        if (replica.is_dfs_replica()) {
+        if (replica.is_kv_replica()) {
+            auto io = std::atomic_load(&kv_io_);
+            const auto error = io ? io->Read(key, replica.get_kv_descriptor(),
+                                             slices_it->second)
+                                  : ErrorCode::NOT_SUPPORTED;
+            if (error != ErrorCode::OK)
+                results[i] = tl::unexpected(error);
+            else
+                results[i] = {};
+            continue;
+        } else if (replica.is_dfs_replica()) {
             if (!dfs_storage_backend_) {
                 LOG(ERROR) << "DFS backend is not initialized";
                 if (auto* dfs_metric = GetDfsMetricPtr()) {
@@ -1959,6 +1991,13 @@ bool Client::RedirectToHotCache(const std::string& key,
 tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
                                           std::vector<Slice>& slices,
                                           const ReplicateConfig& config) {
+    const auto kv_io = std::atomic_load(&kv_io_);
+    ReplicateConfig effective = config;
+    if (kv_io) effective.kv_replica_num = 1;
+    if (effective.kv_replica_num &&
+        (!kv_io || effective.replica_num == 0 || effective.nof_replica_num ||
+         effective.dfs_replica_num))
+        return tl::unexpected(ErrorCode::NOT_SUPPORTED);
     std::optional<uint64_t> object_checksum;
     if (object_checksum_enabled_) {
         auto checksum_result = ComputeObjectChecksumForSlices(
@@ -1975,7 +2014,7 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
         slice_lengths.emplace_back(slices[i].size);
     }
 
-    ReplicateConfig client_cfg = AttachHostId(config);
+    ReplicateConfig client_cfg = AttachHostId(effective);
     if (protocol_ == "cxl") {
         client_cfg.preferred_segment = local_hostname_;
     }
@@ -1994,6 +2033,16 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
     if (!start_result) {
         ErrorCode err = start_result.error();
         if (err == ErrorCode::OBJECT_ALREADY_EXISTS) {
+            if (kv_io) {
+                auto existing = Query(key);
+                if (!existing ||
+                    std::none_of(existing->replicas.begin(),
+                                 existing->replicas.end(),
+                                 [](const auto& replica) {
+                                     return replica.is_kv_replica();
+                                 }))
+                    return tl::unexpected(ErrorCode::INVALID_WRITE);
+            }
             VLOG(1) << "object_already_exists key=" << key;
             return {};
         }
@@ -2010,6 +2059,20 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
     ReplicaTransferSummary transfer_summary;
     for (const auto& replica : start_result.value()) {
         transfer_summary.RecordAllocatedReplica(replica);
+    }
+
+    std::unique_ptr<KvWrite> kv_write;
+    if (kv_io) {
+        for (const auto& replica : *start_result) {
+            if (!replica.is_kv_replica()) continue;
+            auto submitted =
+                kv_io->StartWrite(key, replica.get_kv_descriptor(), slices);
+            if (submitted)
+                kv_write = std::move(*submitted);
+            else
+                transfer_summary.RecordFailure(ReplicaType::KVCLIENT,
+                                               submitted.error());
+        }
     }
 
     // Record Put transfer latency (all replicas)
@@ -2085,8 +2148,25 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
         metrics_->transfer_metric.put_latency_us.observe(us_put);
     }
 
+    if (kv_write) {
+        const auto status = kv_write->Wait();
+        if (status == ErrorCode::OK) {
+            transfer_summary.RecordSuccess(ReplicaType::KVCLIENT);
+            // The master alone controls visibility. Preserve the data on an
+            // uncertain finalize RPC response instead of deleting a live copy.
+        } else
+            transfer_summary.RecordFailure(ReplicaType::KVCLIENT, status);
+    }
+
     const auto finalize_decision =
-        DetermineFinalizeDecision(config, transfer_summary);
+        DetermineFinalizeDecision(effective, transfer_summary);
+
+    if (kv_write) {
+        if (finalize_decision.success)
+            (void)kv_write->Commit();
+        else
+            kv_write.reset();
+    }
 
     if (finalize_decision.end_type.has_value()) {
         auto end_result = master_client_.PutEnd(
@@ -2176,6 +2256,7 @@ Client::DiskReplicaHealResult Client::healDanglingLocalDiskReplica(
 tl::expected<void, ErrorCode> Client::Upsert(const ObjectKey& key,
                                              std::vector<Slice>& slices,
                                              const ReplicateConfig& config) {
+    if (HasKvClient()) return tl::unexpected(ErrorCode::NOT_SUPPORTED);
     std::optional<uint64_t> object_checksum;
     if (object_checksum_enabled_) {
         auto checksum_result = ComputeObjectChecksumForSlices(
@@ -2361,6 +2442,8 @@ class PutOperation {
     tl::expected<void, ErrorCode> result;
     std::vector<Replica::Descriptor> replicas;
     std::vector<PendingTransferRecord> pending_transfers;
+    std::unique_ptr<KvWrite> kv_write;
+    size_t requested_kv_replicas = 0;
 
     size_t requested_memory_replicas = 0;
     size_t requested_nof_replicas = 0;
@@ -2418,6 +2501,7 @@ class PutOperation {
         requested_memory_replicas = config.replica_num;
         requested_nof_replicas = config.nof_replica_num;
         requested_dfs_replicas = config.dfs_replica_num;
+        requested_kv_replicas = config.kv_replica_num;
     }
 
     ReplicateConfig ToReplicateConfig() const {
@@ -2425,6 +2509,7 @@ class PutOperation {
         config.replica_num = requested_memory_replicas;
         config.nof_replica_num = requested_nof_replicas;
         config.dfs_replica_num = requested_dfs_replicas;
+        config.kv_replica_num = requested_kv_replicas;
         return config;
     }
 
@@ -2441,6 +2526,41 @@ class PutOperation {
         return state == PutOperationState::SUCCESS && result.has_value();
     }
 };
+
+void Client::StartKvTransfers(std::vector<PutOperation>& ops,
+                              const std::shared_ptr<KvClientIO>& io) {
+    if (!io) return;
+    for (auto& op : ops) {
+        if (op.IsResolved()) {
+            if (!op.result &&
+                op.result.error() == ErrorCode::OBJECT_ALREADY_EXISTS) {
+                auto existing = Query(op.key);
+                if (!existing ||
+                    std::none_of(existing->replicas.begin(),
+                                 existing->replicas.end(),
+                                 [](const auto& replica) {
+                                     return replica.is_kv_replica();
+                                 }))
+                    op.SetTerminalError(ErrorCode::INVALID_WRITE,
+                                        PutOperationState::MASTER_FAILED);
+            }
+            continue;
+        }
+        auto replica =
+            std::find_if(op.replicas.begin(), op.replicas.end(),
+                         [](const auto& r) { return r.is_kv_replica(); });
+        if (replica == op.replicas.end()) {
+            op.SetError(ErrorCode::INVALID_REPLICA, "Missing ASU allocation");
+            continue;
+        }
+        auto submitted =
+            io->StartWrite(op.key, replica->get_kv_descriptor(), op.slices);
+        if (!submitted)
+            op.SetError(submitted.error(), "ASU submit failed");
+        else
+            op.kv_write = std::move(*submitted);
+    }
+}
 
 std::vector<PutOperation> Client::CreatePutOperations(
     const std::vector<ObjectKey>& keys,
@@ -3077,6 +3197,15 @@ void Client::SubmitDfsWrites(std::vector<PutOperation>& ops) {
 }
 
 void Client::FinalizeBatchPut(std::vector<PutOperation>& ops) {
+    for (auto& op : ops) {
+        if (!op.kv_write) continue;
+        const auto status = op.kv_write->Wait();
+        if (status == ErrorCode::OK) {
+            op.transfer_summary.RecordSuccess(ReplicaType::KVCLIENT);
+        } else
+            op.transfer_summary.RecordFailure(ReplicaType::KVCLIENT, status);
+    }
+
     struct BatchFinalizeGroup {
         std::vector<std::string> keys;
         std::vector<size_t> indices;
@@ -3140,6 +3269,7 @@ void Client::FinalizeBatchPut(std::vector<PutOperation>& ops) {
     for (size_t i = 0; i < ops.size(); ++i) {
         auto& op = ops[i];
         if (op.IsResolved()) {
+            op.kv_write.reset();
             if (!op.IsSuccessful() && !op.replicas.empty()) {
                 terminal_errors[i] = op.result.has_value()
                                          ? ErrorCode::INTERNAL_ERROR
@@ -3157,6 +3287,12 @@ void Client::FinalizeBatchPut(std::vector<PutOperation>& ops) {
 
         const auto finalize_decision = DetermineFinalizeDecision(
             op.ToReplicateConfig(), op.transfer_summary);
+        if (op.kv_write) {
+            if (finalize_decision.success)
+                (void)op.kv_write->Commit();
+            else
+                op.kv_write.reset();
+        }
         should_succeed[i] = finalize_decision.success;
         terminal_errors[i] = finalize_decision.error;
         add_finalize_action(finalize_decision.end_type, true, op.key, i);
@@ -3581,7 +3717,15 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPut(
     const std::vector<ObjectKey>& keys,
     std::vector<std::vector<Slice>>& batched_slices,
     const ReplicateConfig& config, const WriteBufferStager& stager) {
-    ReplicateConfig client_cfg = AttachHostId(config);
+    const auto kv_io = std::atomic_load(&kv_io_);
+    ReplicateConfig effective = config;
+    if (kv_io) effective.kv_replica_num = 1;
+    if (effective.kv_replica_num &&
+        (!kv_io || effective.replica_num == 0 || effective.nof_replica_num ||
+         effective.dfs_replica_num))
+        return std::vector<tl::expected<void, ErrorCode>>(
+            keys.size(), tl::unexpected(ErrorCode::NOT_SUPPORTED));
+    ReplicateConfig client_cfg = AttachHostId(effective);
     if (protocol_ == "cxl") {
         client_cfg.preferred_segment = local_hostname_;
     }
@@ -3594,12 +3738,14 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPut(
         }
         StartBatchPut(ops, client_cfg);
         StageWriteBuffersForRemoteReplicas(ops, stager);
+        StartKvTransfers(ops, kv_io);
         return BatchWriteWhenPreferSameNode(ops, false);
     }
     StartBatchPut(ops, client_cfg);
     StageWriteBuffersForRemoteReplicas(ops, stager);
 
     auto t0 = std::chrono::steady_clock::now();
+    StartKvTransfers(ops, kv_io);
     SubmitTransfers(ops);
     WaitForTransfers(ops);
     SubmitDfsWrites(ops);
@@ -3620,6 +3766,9 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchUpsert(
     const std::vector<ObjectKey>& keys,
     std::vector<std::vector<Slice>>& batched_slices,
     const ReplicateConfig& config) {
+    if (HasKvClient())
+        return std::vector<tl::expected<void, ErrorCode>>(
+            keys.size(), tl::unexpected(ErrorCode::NOT_SUPPORTED));
     return BatchUpsert(keys, batched_slices, config, {});
 }
 
@@ -3627,6 +3776,9 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchUpsert(
     const std::vector<ObjectKey>& keys,
     std::vector<std::vector<Slice>>& batched_slices,
     const ReplicateConfig& config, const WriteBufferStager& stager) {
+    if (HasKvClient())
+        return std::vector<tl::expected<void, ErrorCode>>(
+            keys.size(), tl::unexpected(ErrorCode::NOT_SUPPORTED));
     ReplicateConfig client_cfg = AttachHostId(config);
     if (protocol_ == "cxl") {
         client_cfg.preferred_segment = local_hostname_;
@@ -3709,6 +3861,19 @@ tl::expected<void, ErrorCode> Client::Remove(const ObjectKey& key, bool force) {
         hot_cache_->BumpKeyGeneration(key);
     }
 
+    auto io = std::atomic_load(&kv_io_);
+    if (io) {
+        auto removed = master_client_.RemoveWithKvReplicas(key, force);
+        if (!removed) return tl::unexpected(removed.error());
+        ErrorCode error = ErrorCode::OK;
+        for (const auto& info : *removed) {
+            const auto status = io->Delete(key, info);
+            if (status != ErrorCode::OK) error = status;
+        }
+        if (hot_cache_) hot_cache_->RemoveHotKey(key);
+        if (error != ErrorCode::OK) return tl::unexpected(error);
+        return {};
+    }
     auto result = master_client_.Remove(key, force);
     // if (storage_backend_) {
     //     storage_backend_->RemoveFile(key);
@@ -3725,6 +3890,7 @@ tl::expected<void, ErrorCode> Client::Remove(const ObjectKey& key, bool force) {
 
 tl::expected<long, ErrorCode> Client::RemoveByRegex(const ObjectKey& str,
                                                     bool force) {
+    if (HasKvClient()) return tl::unexpected(ErrorCode::NOT_SUPPORTED);
     if (hot_cache_) {
         hot_cache_->BumpCacheEpoch();
     }
@@ -3744,6 +3910,7 @@ tl::expected<long, ErrorCode> Client::RemoveByRegex(const ObjectKey& str,
 }
 
 tl::expected<long, ErrorCode> Client::RemoveAll(bool force) {
+    if (HasKvClient()) return tl::unexpected(ErrorCode::NOT_SUPPORTED);
     if (hot_cache_) {
         hot_cache_->BumpCacheEpoch();
     }
@@ -3762,6 +3929,13 @@ tl::expected<long, ErrorCode> Client::RemoveAll(bool force) {
 
 std::vector<tl::expected<void, ErrorCode>> Client::BatchRemove(
     const std::vector<ObjectKey>& keys, bool force) {
+    if (HasKvClient()) {
+        std::vector<tl::expected<void, ErrorCode>> results;
+        results.reserve(keys.size());
+        for (const auto& key : keys) results.push_back(Remove(key, force));
+        return results;
+    }
+
     if (hot_cache_) {
         hot_cache_->BumpKeyGenerations(keys);
     }
@@ -4857,6 +5031,11 @@ std::vector<tl::expected<int64_t, ErrorCode>> Client::BatchTransferWriteRanges(
     const std::vector<std::vector<Slice>>& slices,
     const std::vector<std::vector<uint64_t>>& dst_offsets,
     TransferIntent intent) {
+    if (HasKvClient())
+        return std::vector<tl::expected<int64_t, ErrorCode>>(
+            replicas_per_entry.size(),
+            tl::unexpected(ErrorCode::NOT_SUPPORTED));
+
     std::vector<tl::expected<int64_t, ErrorCode>> results(
         replicas_per_entry.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
     if (replicas_per_entry.size() != slices.size() ||
@@ -4970,6 +5149,7 @@ ErrorCode Client::TransferWrite(const Replica::Descriptor& replica_descriptor,
 ErrorCode Client::TransferWriteRange(
     const Replica::Descriptor& replica_descriptor, std::vector<Slice>& slices,
     uint64_t dst_offset) {
+    if (HasKvClient()) return ErrorCode::NOT_SUPPORTED;
     auto future = SubmitRangeWrite(replica_descriptor, slices, dst_offset);
     if (!future) {
         LOG(ERROR) << "Failed to submit range write operation";
@@ -4983,6 +5163,7 @@ ErrorCode Client::TransferWriteRange(
 ErrorCode Client::TransferRead(const Replica::Descriptor& replica_descriptor,
                                std::vector<Slice>& slices,
                                TransferIntent intent) {
+    if (replica_descriptor.is_kv_replica()) return ErrorCode::NOT_SUPPORTED;
     size_t total_size = 0;
     if (replica_descriptor.is_memory_replica()) {
         auto& mem_desc = replica_descriptor.get_memory_descriptor();

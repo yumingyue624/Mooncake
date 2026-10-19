@@ -31,6 +31,7 @@ enum class ReplicaType {
     NOF_SSD = 3,     // Nvme-oF SSD replica
     ALL = 4,         // All synchronous replicas in put finalize path
     DFS = 100,       // Distributed filesystem page-offset replica
+    KVCLIENT = 101,  // Shared immutable ASU object, addressed by generation
 };
 
 struct LiveAllocation {

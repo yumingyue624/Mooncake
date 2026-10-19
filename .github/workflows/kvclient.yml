@@ -1,0 +1,35 @@
+name: KvClient dual-write tests
+on:
+  push:
+    branches: [feat/client-kvclient]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  cpu:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Install CPU build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build build-essential cmake libibverbs-dev libgoogle-glog-dev libgflags-dev libjsoncpp-dev libunwind-dev libnuma-dev python3-dev libboost-all-dev libssl-dev libgrpc-dev libgrpc++-dev libprotobuf-dev libyaml-cpp-dev protobuf-compiler-grpc libcurl4-openssl-dev libhiredis-dev liburing-dev libjemalloc-dev libmsgpack-dev libzmq3-dev libzstd-dev libasio-dev libxxhash-dev libfmt-dev libspdlog-dev zlib1g-dev libgtest-dev
+      - uses: actions/checkout@v4
+        with:
+          repository: ModelEngine-Group/unified-cache-management
+          ref: 2ddf1335164e9d4fb734d1d1fa90f7794136561a
+          path: sdk-source
+      - name: Build the real SDK with the CPU simulator
+        run: |
+          cmake -S sdk-source/kv_semantics -B sdk-build -G Ninja -DRUNTIME_ENVIRONMENT=simu -DBUILD_UNIT_TESTS=OFF -DBUILD_KV_CLIENT_PROVIDER_FAKE=ON -DCMAKE_BUILD_TYPE=Release
+          cmake --build sdk-build --target kv_client -j2
+      - name: Configure Mooncake with SDK support
+        run: |
+          cmake -S . -B build -G Ninja -DUSE_KVCLIENT=ON -DKVCLIENT_INCLUDE_DIR="$PWD/sdk-source/kv_semantics/include" -DKVCLIENT_LIBRARY="$PWD/sdk-build/src/libkv_client.so" -DUSE_CUDA=OFF -DUSE_HTTP=ON -DBUILD_UNIT_TESTS=ON -DBUILD_EXAMPLES=OFF -DBUILD_BENCHMARK=OFF -DWITH_STORE_RUST=OFF -DWITH_STORE_C_SHARED=OFF -DENABLE_DEBUG_SYMBOLS=OFF -DCMAKE_BUILD_TYPE=Release
+      - name: Build and run Client tests against the production data paths
+        run: |
+          cmake --build build --target client_kvclient_test kvclient_dual_write_test -j2
+          ctest --test-dir build -R '^(client_kvclient_test|kvclient_dual_write_test)$' --output-on-failure

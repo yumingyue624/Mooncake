@@ -24,17 +24,23 @@ tl::expected<void, ErrorCode> Client::InitKvClient(
                                   ? ErrorCode::INVALID_PARAMS
                                   : ErrorCode::INTERNAL_ERROR);
     }
-    SetKvClient(std::move(client));
-    return {};
+    return SetKvClient(std::move(client));
 #else
     (void)config_path;
     return tl::unexpected(ErrorCode::NOT_SUPPORTED);
 #endif
 }
 
-void Client::SetKvClient(std::shared_ptr<kv::KvClient> client) {
+tl::expected<void, ErrorCode> Client::SetKvClient(
+    std::shared_ptr<kv::KvClient> client) {
+    auto io = MakeKvClientIO(client, tenant_id());
+    if (client && !io) return tl::unexpected(ErrorCode::NOT_SUPPORTED);
+    std::atomic_store(&kv_io_, std::move(io));
     std::atomic_store(&kv_client_, std::move(client));
+    return {};
 }
+
+bool Client::HasKvClient() const { return bool(std::atomic_load(&kv_io_)); }
 
 std::shared_ptr<kv::KvClient> Client::GetKvClient() const {
     return std::atomic_load(&kv_client_);

@@ -3830,7 +3830,8 @@ std::shared_ptr<BufferHandle> RealClient::get_buffer_internal(
     // the replica we selected, preventing accidental LOCAL_DISK picks.
     auto runtime_accelerator =
         device::GetAcceleratorRegistry().RuntimeAccelerators();
-    if ((replica.is_disk_replica() || replica.is_dfs_replica()) &&
+    if ((replica.is_disk_replica() || replica.is_dfs_replica() ||
+         replica.is_kv_replica()) &&
         runtime_accelerator.FindDeviceForPointer(buffer_handle->ptr())) {
         LOG(WARNING) << (replica.is_dfs_replica() ? "DFS" : "DISK")
                      << " replica for key '" << key
@@ -4192,7 +4193,8 @@ RealClient::batch_get_buffer_internal(
         // the read will fail.
         auto runtime_accelerator =
             device::GetAcceleratorRegistry().RuntimeAccelerators();
-        if ((replica.is_disk_replica() || replica.is_dfs_replica()) &&
+        if ((replica.is_disk_replica() || replica.is_dfs_replica() ||
+             replica.is_kv_replica()) &&
             runtime_accelerator.FindDeviceForPointer(buffer_handle->ptr())) {
             LOG(WARNING)
                 << (replica.is_dfs_replica() ? "DFS" : "DISK")
@@ -4661,7 +4663,8 @@ tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
             return static_cast<int64_t>(total_size);
         }
 
-        if (replica.is_disk_replica() || replica.is_dfs_replica()) {
+        if (replica.is_disk_replica() || replica.is_dfs_replica() ||
+            replica.is_kv_replica()) {
             // File-backed full read: use a contiguous temp buffer, then
             // scatter to the requested destination.
             const char *replica_type =
@@ -4810,7 +4813,8 @@ tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
             src_offset + size);
     }
 
-    if (replica.is_disk_replica() || replica.is_dfs_replica()) {
+    if (replica.is_disk_replica() || replica.is_dfs_replica() ||
+        replica.is_kv_replica()) {
         // DISK/DFS: client_->Get + allocateSlices requires full-object slices,
         // so we must allocate total_size.
         const char *replica_type = replica.is_dfs_replica() ? "DFS" : "DISK";
@@ -6452,7 +6456,8 @@ RealClient::batch_get_into_internal(
             results[i] = static_cast<int64_t>(total_size);
             continue;
         }
-        if (replica.is_disk_replica() || replica.is_dfs_replica()) {
+        if (replica.is_disk_replica() || replica.is_dfs_replica() ||
+            replica.is_kv_replica()) {
             // File-backed replicas cannot safely read directly into arbitrary
             // user buffers. Use a contiguous temp buffer, then scatter.
             disk_operations.emplace_back(
@@ -6817,6 +6822,10 @@ std::vector<int> RealClient::batch_put_from_multi_buffers(
 
 std::vector<int> RealClient::batch_get_session_start(
     const std::vector<std::string> &keys) {
+    if (client_ && client_->HasKvClient())
+        return std::vector<int>(
+            keys.size(), static_cast<int>(toInt(ErrorCode::NOT_SUPPORTED)));
+
     std::vector<int> results(
         keys.size(), static_cast<int>(toInt(ErrorCode::INVALID_PARAMS)));
     if (!client_) {
@@ -7479,6 +7488,10 @@ void RealClient::wait_session_put_idle(std::unique_lock<std::mutex> &lock,
 std::vector<int> RealClient::batch_put_session_start(
     const std::vector<std::string> &keys, const std::vector<size_t> &sizes,
     const ReplicateConfig &config) {
+    if (client_ && client_->HasKvClient())
+        return std::vector<int>(
+            keys.size(), static_cast<int>(toInt(ErrorCode::NOT_SUPPORTED)));
+
     std::vector<int> results(keys.size(), 0);
     if (!client_) {
         LOG(ERROR) << "Client is not initialized";
@@ -8056,7 +8069,8 @@ RealClient::batch_get_into_multi_buffers_internal(
                 key_slices.emplace_back(Slice{buffers[j], sizes[j]});
             }
         } else if (replica.is_local_disk_replica() ||
-                   replica.is_disk_replica() || replica.is_dfs_replica()) {
+                   replica.is_disk_replica() || replica.is_dfs_replica() ||
+                   replica.is_kv_replica()) {
             // LOCAL_DISK: GPU buffers passed directly as scatter-gather slices
             // (zero-copy). DISK/DFS use a contiguous temp buffer at read time.
             if (valid_local_disk_ops.count(key)) {

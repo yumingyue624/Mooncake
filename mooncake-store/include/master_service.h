@@ -657,6 +657,9 @@ class MasterService {
      * @return ErrorCode::OK on success, ErrorCode::OBJECT_NOT_FOUND if not
      * found
      */
+    auto RemoveWithKvReplicas(const std::string& key, const TenantId& tenant_id,
+                              bool force = false)
+        -> tl::expected<std::vector<KvObjectInfo>, ErrorCode>;
     auto Remove(const std::string& key, const TenantId& tenant_id,
                 bool force = false) -> tl::expected<void, ErrorCode>;
 

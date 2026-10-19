@@ -133,6 +133,11 @@ struct RpcNameTraits<&WrappedMasterService::BatchUpsertRevoke> {
 };
 
 template <>
+struct RpcNameTraits<&WrappedMasterService::RemoveWithKvReplicas> {
+    static constexpr const char* value = "RemoveWithKvReplicas";
+};
+
+template <>
 struct RpcNameTraits<&WrappedMasterService::Remove> {
     static constexpr const char* value = "Remove";
 };
@@ -841,6 +846,13 @@ std::vector<tl::expected<void, ErrorCode>> MasterClient::BatchUpsertRevoke(
             keys.size(), client_id_, keys, tenant_id_.value());
     timer.LogResponse("result=", result.size(), " operations");
     return result;
+}
+
+tl::expected<std::vector<KvObjectInfo>, ErrorCode>
+MasterClient::RemoveWithKvReplicas(const std::string& key, bool force) {
+    return invoke_rpc<&WrappedMasterService::RemoveWithKvReplicas,
+                      std::vector<KvObjectInfo>>(key, force,
+                                                 tenant_id_.value());
 }
 
 tl::expected<void, ErrorCode> MasterClient::Remove(const std::string& key,
