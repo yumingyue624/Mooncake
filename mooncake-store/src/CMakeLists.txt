@@ -98,6 +98,7 @@ set(MOONCAKE_STORE_MASTER_SOURCES
     ha_metric_manager.cpp)
 
 set(MOONCAKE_STORE_CLIENT_SOURCES
+    client_kvclient.cpp
     common/client_buffer_allocation.cpp
     mmap_arena.cpp
     config/hugepage_config.cpp
@@ -548,6 +549,11 @@ endif()
 # Sources used only by Store clients and the complete mooncake_store library.
 add_library(mooncake_store_client_objects OBJECT
             ${MOONCAKE_STORE_CLIENT_SOURCES})
+if(USE_KVCLIENT)
+  target_compile_definitions(mooncake_store_client_objects PRIVATE USE_KVCLIENT)
+  target_link_libraries(mooncake_store_client_objects
+                        PRIVATE Mooncake::kvclient)
+endif()
 set_target_properties(mooncake_store_client_objects
                       PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_include_directories(
@@ -657,6 +663,9 @@ add_library(
   $<TARGET_OBJECTS:mooncake_store_master_objects>
   $<TARGET_OBJECTS:mooncake_store_client_objects>)
 target_include_directories(mooncake_store PUBLIC ${MOONCAKE_STORE_INCLUDE_DIRS})
+if(USE_KVCLIENT)
+  target_link_libraries(mooncake_store PUBLIC Mooncake::kvclient)
+endif()
 target_link_libraries(
   mooncake_store
   PUBLIC mooncake_local_ssd

@@ -28,6 +28,10 @@
 #include "local_hot_cache.h"
 #include "pinned_buffer_pool.h"
 
+namespace kv {
+class KvClient;
+}
+
 namespace mooncake {
 
 class PutOperation;
@@ -84,6 +88,27 @@ class Client {
 
     const UUID& getClientId() const { return client_id_; }
     const std::string& tenant_id() const { return master_client_.tenant_id(); }
+
+    /**
+     * Create and initialize the optional UCM KvClient from its SDK config.
+     * Requires USE_KVCLIENT at build time. Failure preserves any existing
+     * attachment. This does not enable automatic Put/Get mirroring.
+     */
+    tl::expected<void, ErrorCode> InitKvClient(const std::string& config_path);
+
+    /**
+     * Attach an already initialized KvClient, or detach with nullptr.
+     * The caller remains responsible for draining tasks and unregistering
+     * memory before shutting down the SDK. Replacement does not call Shutdown.
+     */
+    void SetKvClient(std::shared_ptr<kv::KvClient> client);
+
+    /**
+     * Return an owning snapshot for direct access to the native SDK API.
+     * Keep it alive until submitted operations complete. May return nullptr.
+     * Get/Set are thread-safe; SDK Shutdown must be coordinated by the caller.
+     */
+    std::shared_ptr<kv::KvClient> GetKvClient() const;
 
     /**
      * @brief Creates and initializes a new Client instance
@@ -1016,6 +1041,7 @@ class Client {
     std::unique_ptr<ClientMetric> metrics_;
 
     // Core components
+    std::shared_ptr<kv::KvClient> kv_client_;
     std::shared_ptr<TransferEngine> transfer_engine_;
     MasterClient master_client_;
     std::unique_ptr<TransferSubmitter> transfer_submitter_;
