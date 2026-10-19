@@ -1,7 +1,8 @@
 #include "client_service.h"
 
-#ifdef USE_KVCLIENT
 #include <glog/logging.h>
+
+#ifdef USE_KVCLIENT
 #include <kv_client.h>
 #endif
 
@@ -26,7 +27,9 @@ tl::expected<void, ErrorCode> Client::InitKvClient(
     }
     return SetKvClient(std::move(client));
 #else
-    (void)config_path;
+    if (!config_path.empty())
+        LOG(ERROR) << "KvClient is configured but Mooncake was built without "
+                      "USE_KVCLIENT";
     return tl::unexpected(ErrorCode::NOT_SUPPORTED);
 #endif
 }

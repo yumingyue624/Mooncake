@@ -37,10 +37,12 @@ jobs:
       - name: Configure Mooncake with SDK support
         run: |
           cmake -S . -B build -G Ninja -DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DUSE_KVCLIENT=ON -DKVCLIENT_INCLUDE_DIR="$PWD/sdk-source/kv_semantics/include" -DKVCLIENT_LIBRARY="$PWD/sdk-build/src/libkv_client.so" -DUSE_CUDA=OFF -DUSE_HTTP=ON -DBUILD_UNIT_TESTS=ON -DBUILD_EXAMPLES=OFF -DBUILD_BENCHMARK=OFF -DWITH_STORE_RUST=OFF -DWITH_STORE_C_SHARED=OFF -DENABLE_DEBUG_SYMBOLS=OFF -DCMAKE_BUILD_TYPE=Release
-      - name: Build and run Client tests against the production data paths
+      - name: Build Client tests against the production data paths
         run: |
           cmake --build build --target client_kvclient_test kvclient_dual_write_test serializer_test -j2
-          ctest --test-dir build -R '^(client_kvclient_test|kvclient_dual_write_test|serializer_test)$' --output-on-failure
+      - name: Run Client and snapshot tests
+        run: |
+          MOONCAKE_TEST_REAL_KVCLIENT_FAKE=1 ctest --test-dir build -R '^(client_kvclient_test|kvclient_dual_write_test|serializer_test)$' --timeout 180 --output-on-failure
       - uses: actions/cache/save@v4
         if: always() && steps.compiler-cache.outputs.cache-hit != 'true'
         with:

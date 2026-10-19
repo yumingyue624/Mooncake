@@ -4,6 +4,7 @@
 #include "serializer.h"
 #include "serialize/serializer.h"
 #include "segment.h"
+#include "replica.h"
 
 namespace mooncake::test {
 

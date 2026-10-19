@@ -73,6 +73,11 @@ struct Buffer {
             Align(reinterpret_cast<uintptr_t>(allocation.get())));
         std::memset(data, 0, size);
     }
+    ~Buffer() {
+        // An exception must not free a still-registered DMA region. Normal
+        // release clears the handle only after unregister/shutdown succeeds.
+        if (handle != kv::kInvalidMRHandle) (void)allocation.release();
+    }
     std::unique_ptr<char[]> allocation;
     char* data;
     size_t size;
@@ -95,7 +100,7 @@ class NativeWrite final : public KvWrite {
     std::unique_ptr<Buffer> buffer_;
     KvObjectInfo info_;
     kv::TaskId task_;
-    ErrorCode result_ = ErrorCode::OK;
+    ErrorCode result_ = ErrorCode::TRANSFER_FAIL;
     bool waited_ = false;
     bool committed_ = false;
 };
@@ -111,8 +116,15 @@ class NativeIO final : public KvClientIO,
         // Pending task objects retain this owner. All normal IO has drained
         // before destruction; shutdown fences registrations quarantined after
         // timeout/transport errors. Never free DMA buffers on failed shutdown.
-        if (!sdk_->Shutdown().ok()) {
-            for (auto& buffer : quarantine_) (void)buffer.release();
+        bool stopped = false;
+        try {
+            stopped = sdk_->Shutdown().ok();
+        } catch (...) {
+        }
+        if (stopped) {
+            for (auto& buffer : quarantine_)
+                buffer->handle = kv::kInvalidMRHandle;
+        } else {
             LOG(ERROR)
                 << "KvClient shutdown failed; retaining unsafe IO buffers";
         }
@@ -255,6 +267,7 @@ class NativeIO final : public KvClientIO,
                                     buffer.size};
             std::vector<kv::RegisteredMemory> registered;
             auto status = sdk_->RegisterRegions({region}, registered);
+            if (!registered.empty()) buffer.handle = registered.front().handle;
             for (const auto& region : registered)
                 buffer.handles.push_back(region.handle);
             if (!buffer.handles.empty()) buffer.handle = buffer.handles.front();
@@ -273,7 +286,10 @@ class NativeIO final : public KvClientIO,
         if (status.ok() && task == kv::kInvalidTaskId)
             return ErrorCode::TRANSFER_FAIL;
         if (!status.ok()) {
-            if (task != kv::kInvalidTaskId) (void)WaitTask(task);
+            if (task != kv::kInvalidTaskId && WaitTask(task) != ErrorCode::OK) {
+                task = kv::kInvalidTaskId;
+                return ErrorCode::TRANSFER_FAIL;
+            }
             task = kv::kInvalidTaskId;
             return Convert(status);
         }
@@ -288,7 +304,10 @@ class NativeIO final : public KvClientIO,
     void Release(std::unique_ptr<Buffer> buffer, bool safe) {
         if (!buffer) return;
         if (buffer->handle == kv::kInvalidMRHandle) return;
-        if (safe && sdk_->UnregisterRegions(buffer->handles).ok()) return;
+        if (safe && sdk_->UnregisterRegions(buffer->handles).ok()) {
+            buffer->handle = kv::kInvalidMRHandle;
+            return;
+        }
         std::lock_guard<std::mutex> lock(mutex_);
         quarantine_.push_back(std::move(buffer));
     }
@@ -347,11 +366,17 @@ ErrorCode NativeWrite::Start() {
     return result_;
 }
 NativeWrite::~NativeWrite() {
-    (void)Wait();
-    if (!committed_ && owner_->Delete(key_, info_) != ErrorCode::OK)
-        LOG(WARNING) << "Failed to clean up unpublished ASU generation for "
-                     << key_;
-    owner_->Release(std::move(buffer_), result_ != ErrorCode::TRANSFER_FAIL);
+    try {
+        (void)Wait();
+        if (!committed_ && owner_->Delete(key_, info_) != ErrorCode::OK)
+            LOG(WARNING) << "Failed to clean up unpublished ASU generation for "
+                         << key_;
+        owner_->Release(std::move(buffer_),
+                        result_ != ErrorCode::TRANSFER_FAIL);
+    } catch (...) {
+        // Buffer's destructor conservatively retains registered storage.
+        LOG(ERROR) << "Exception while draining ASU IO for " << key_;
+    }
 }
 ErrorCode NativeWrite::Wait() {
     if (!waited_) {

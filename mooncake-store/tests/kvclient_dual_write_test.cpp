@@ -4,6 +4,8 @@
 #include <cstring>
 #include <algorithm>
 #include <cstdlib>
+#include <filesystem>
+#include <fstream>
 #include <functional>
 #include <map>
 #include <mutex>
@@ -200,7 +202,7 @@ class KvDualWriteTest : public ::testing::Test {
         reader = Create("127.0.0.1:18303");
         ASSERT_TRUE(writer && provider && reader);
         segment = allocate_buffer_allocator_memory(segment_size);
-        source = allocate_buffer_allocator_memory(4096);
+        source = std::aligned_alloc(512, 4096);
         ASSERT_TRUE(segment && source);
         ASSERT_TRUE(provider->MountSegment(segment, segment_size, "tcp"));
         ASSERT_TRUE(writer->RegisterLocalMemory(source, 4096, "cpu:0"));
@@ -362,6 +364,60 @@ TEST_F(KvDualWriteTest, RejectsMutableAndUnenumerableOperations) {
     EXPECT_FALSE(writer->Upsert("mutable", slices, {}));
     EXPECT_FALSE(writer->RemoveAll());
     EXPECT_FALSE(writer->RemoveByRegex(".*"));
+}
+
+TEST_F(KvDualWriteTest, ProductionFactoryAndRealSdkCpuProviderRoundtrip) {
+    if (!std::getenv("MOONCAKE_TEST_REAL_KVCLIENT_FAKE"))
+        GTEST_SKIP()
+            << "Requires the SDK CPU-simulator build with FAKE provider";
+
+    const auto root =
+        std::filesystem::temp_directory_path() /
+        ("mooncake-kvclient-sdk-" + UuidToString(generate_uuid()));
+    std::filesystem::create_directories(root);
+    struct DirectoryCleanup {
+        std::filesystem::path path;
+        ~DirectoryCleanup() {
+            std::error_code error;
+            std::filesystem::remove_all(path, error);
+        }
+    } cleanup{root};
+    const auto config_path = root / "kvclient.conf";
+    {
+        std::ofstream config(config_path);
+        config << "transport.asu_ids=1\ntransport.provider_type=FAKE\n"
+                  "transport.device_id=0\nhash_table.type=RING_HASH\n"
+                  "asu_info.1=protocol=TCP,local.comm_id=127.0.0.1,port=19001\n"
+                  "fake_backend.complete_immediately=false\n"
+                  "fake_backend.path="
+               << (root / "objects").string() << '\n';
+        ASSERT_TRUE(config.good());
+    }
+    const char* old = std::getenv("MOONCAKE_KVCLIENT_CONFIG");
+    const std::optional<std::string> saved =
+        old ? std::optional<std::string>(old) : std::nullopt;
+    setenv("MOONCAKE_KVCLIENT_CONFIG", config_path.c_str(), 1);
+    auto native_writer = Create("127.0.0.1:18304");
+    auto native_reader = Create("127.0.0.1:18305");
+    if (saved)
+        setenv("MOONCAKE_KVCLIENT_CONFIG", saved->c_str(), 1);
+    else
+        unsetenv("MOONCAKE_KVCLIENT_CONFIG");
+    ASSERT_TRUE(native_writer && native_reader);
+    ASSERT_TRUE(native_writer->HasKvClient());
+    ASSERT_TRUE(native_writer->RegisterLocalMemory(source, 4096, "cpu:0"));
+    auto slices = Slices();
+    ASSERT_TRUE(native_writer->Put("real-sdk", slices, {}));
+    ASSERT_TRUE(native_writer->unregisterLocalMemory(source));
+    native_writer.reset();
+    ASSERT_TRUE(provider->UnmountSegment(segment, segment_size));
+    provider.reset();
+    std::vector<char> output(1024);
+    std::vector<Slice> destination{{output.data(), output.size()}};
+    ASSERT_TRUE(native_reader->Get("real-sdk", destination));
+    EXPECT_EQ(std::memcmp(source, output.data(), output.size()), 0);
+    ASSERT_TRUE(native_reader->Remove("real-sdk", true));
+    native_reader.reset();
 }
 }  // namespace
 }  // namespace mooncake::test
