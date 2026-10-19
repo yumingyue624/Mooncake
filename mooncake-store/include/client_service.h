@@ -99,16 +99,16 @@ class Client {
 
     /**
      * Attach an already initialized KvClient, or detach with nullptr.
-     * The caller remains responsible for draining tasks and unregistering
-     * memory before shutting down the SDK. Replacement does not call Shutdown.
+     * Configure before serving requests. This attachment owns SDK shutdown;
+     * do not share it with another independently managed Client attachment.
      */
     tl::expected<void, ErrorCode> SetKvClient(
         std::shared_ptr<kv::KvClient> client);
 
     /**
      * Return an owning snapshot for direct access to the native SDK API.
-     * Keep it alive until submitted operations complete. May return nullptr.
-     * Get/Set are thread-safe; SDK Shutdown must be coordinated by the caller.
+     * May return nullptr. Pointer ownership does not prevent SDK shutdown on
+     * detach; do not shut down or consume tasks belonging to this integration.
      */
     std::shared_ptr<kv::KvClient> GetKvClient() const;
     bool HasKvClient() const;

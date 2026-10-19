@@ -1727,7 +1727,7 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
         }
         return results;
     }
-    if (prefer_alloc_in_same_node) {
+    if (prefer_alloc_in_same_node && !HasKvClient()) {
         return BatchGetWhenPreferSameNode(object_keys, query_results, slices);
     }
 
@@ -1950,7 +1950,13 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
 
     if (auto io = std::atomic_load(&kv_io_)) {
         for (size_t i = 0; i < object_keys.size(); ++i) {
-            if (results[i]) continue;
+            if (results[i] ||
+                std::none_of(query_results[i].replicas.begin(),
+                             query_results[i].replicas.end(),
+                             [](const auto& replica) {
+                                 return replica.is_memory_replica();
+                             }))
+                continue;
             auto destination = slices.find(object_keys[i]);
             if (destination == slices.end()) continue;
             auto current = Query(object_keys[i]);

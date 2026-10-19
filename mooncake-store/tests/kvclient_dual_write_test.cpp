@@ -66,7 +66,6 @@ class FakeSdk : public kv::KvClient {
     kv::Status BatchStoreAsync(const std::vector<kv::KVBuffer>& entries,
                                kv::TaskId& task) override {
         ++stores;
-        if (on_store_submit) on_store_submit();
         return Submit(entries, task, false);
     }
     kv::Status BatchLoadAsync(const std::vector<kv::KVBuffer>& entries,
@@ -122,7 +121,6 @@ class FakeSdk : public kv::KvClient {
     }
     bool fail_store = false;
     size_t fail_on_store = 0;
-    std::function<void()> on_store_submit;
     size_t stores = 0;
 
    private:
@@ -205,7 +203,7 @@ class KvDualWriteTest : public ::testing::Test {
         source = allocate_buffer_allocator_memory(4096);
         ASSERT_TRUE(segment && source);
         ASSERT_TRUE(provider->MountSegment(segment, segment_size, "tcp"));
-        ASSERT_TRUE(writer->RegisterLocalMemory(source, 4096));
+        ASSERT_TRUE(writer->RegisterLocalMemory(source, 4096, "cpu:0"));
         std::memset(source, 0x5a, 4096);
         state = std::make_shared<FakeStorage>();
         sdk = std::make_shared<FakeSdk>(state);
@@ -213,7 +211,7 @@ class KvDualWriteTest : public ::testing::Test {
         ASSERT_TRUE(reader->SetKvClient(std::make_shared<FakeSdk>(state)));
     }
     void TearDown() override {
-        if (writer && source) (void)writer->UnregisterLocalMemory(source);
+        if (writer && source) (void)writer->unregisterLocalMemory(source);
         if (provider && segment)
             (void)provider->UnmountSegment(segment, segment_size);
         reader.reset();
@@ -256,9 +254,20 @@ TEST_F(KvDualWriteTest, PutActuallyWritesAsuAndReadsAfterMemoryUnmount) {
     ASSERT_EQ(Info("kv/one").object_size, 1024);
     ASSERT_TRUE(provider->UnmountSegment(segment, segment_size));
     provider.reset();
+    ASSERT_TRUE(writer->unregisterLocalMemory(source));
+    writer.reset();
     std::vector<char> output(1024);
     std::vector<Slice> destination{{output.data(), output.size()}};
     ASSERT_TRUE(reader->Get("kv/one", destination));
+    EXPECT_EQ(std::memcmp(source, output.data(), output.size()), 0);
+    auto query = reader->Query("kv/one");
+    ASSERT_TRUE(query);
+    std::fill(output.begin(), output.end(), 0);
+    std::unordered_map<std::string, std::vector<Slice>> destinations{
+        {"kv/one", destination}};
+    auto batch = reader->BatchGet({"kv/one"}, {*query}, destinations, true);
+    ASSERT_EQ(batch.size(), 1);
+    ASSERT_TRUE(batch[0]);
     EXPECT_EQ(std::memcmp(source, output.data(), output.size()), 0);
 }
 

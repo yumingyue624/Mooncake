@@ -274,6 +274,7 @@ class NativeIO final : public KvClientIO,
             return ErrorCode::TRANSFER_FAIL;
         if (!status.ok()) {
             if (task != kv::kInvalidTaskId) (void)WaitTask(task);
+            task = kv::kInvalidTaskId;
             return Convert(status);
         }
         return ErrorCode::OK;
@@ -347,7 +348,9 @@ ErrorCode NativeWrite::Start() {
 }
 NativeWrite::~NativeWrite() {
     (void)Wait();
-    if (!committed_) (void)owner_->Delete(key_, info_);
+    if (!committed_ && owner_->Delete(key_, info_) != ErrorCode::OK)
+        LOG(WARNING) << "Failed to clean up unpublished ASU generation for "
+                     << key_;
     owner_->Release(std::move(buffer_), result_ != ErrorCode::TRANSFER_FAIL);
 }
 ErrorCode NativeWrite::Wait() {

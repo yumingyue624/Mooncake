@@ -27,7 +27,8 @@ class KvWrite {
     virtual ~KvWrite() = default;
     // Also called by the concrete destructor, so every exit drains the IO.
     virtual ErrorCode Wait() = 0;
-    // Publish ASU visibility only after the memory write has been committed.
+    // Disarm rollback before Master finalization, whose RPC response may be
+    // lost even after publication. Master alone controls object visibility.
     virtual ErrorCode Commit() = 0;
 };
 

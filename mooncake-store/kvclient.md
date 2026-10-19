@@ -50,7 +50,9 @@ key produces a different generation, so old cleanup cannot target the new object
 A 64-bit physical-key collision is detected by the stored identity; it can cause
 a cache IO failure rather than returning another object's bytes.
 
-Each frame and IO length is 512-byte aligned; padding is not returned as user
+An individual framed object must fit the SDK's 32-bit IO length (slightly
+less than 4 GiB after metadata and padding). Each frame and IO length is
+512-byte aligned; padding is not returned as user
 data. TE and SDK registrations are independent. Owned buffers are retained until
 the task is terminal. Transport-error buffers remain registered/quarantined until
 SDK shutdown; failed shutdown retains unsafe buffers instead of freeing memory

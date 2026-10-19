@@ -9,6 +9,20 @@
 namespace mooncake {
 namespace {
 
+TEST(KvClientFactoryTest, ConfiguredSdkFailureFailsProductionClientCreation) {
+    const char* value = std::getenv("MOONCAKE_KVCLIENT_CONFIG");
+    std::optional<std::string> saved;
+    if (value) saved = value;
+    setenv("MOONCAKE_KVCLIENT_CONFIG",
+           "/nonexistent/mooncake-kvclient-test.conf", 1);
+    // Initialization must fail before attempting to connect to a Master.
+    EXPECT_FALSE(Client::Create("localhost:9012", "P2PHANDSHAKE", "tcp"));
+    if (saved)
+        setenv("MOONCAKE_KVCLIENT_CONFIG", saved->c_str(), 1);
+    else
+        unsetenv("MOONCAKE_KVCLIENT_CONFIG");
+}
+
 class KvClientTest : public ::testing::Test {
    protected:
     class StoreClient : public Client {
