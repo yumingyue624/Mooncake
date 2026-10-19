@@ -16,6 +16,7 @@
 
 #include "client_metric.h"
 #include "ha/leadership/leader_coordinator.h"
+#include "kv_device_client.h"
 #include "master_client.h"
 #include "storage_backend.h"
 #include "thread_pool.h"
@@ -547,6 +548,21 @@ class Client {
     }
 
     /**
+     * @brief Attach (or detach with nullptr) an external KV-semantics
+     * storage device client, e.g. an ASU appliance reached through the UCM
+     * kvclient. The port is passive: no Store data path consults it yet;
+     * callers drive the device directly through kv_device_client().
+     */
+    void SetKvDeviceClient(std::shared_ptr<KvDeviceClient> client) {
+        kv_device_client_ = std::move(client);
+    }
+
+    /// @brief The attached KV device client, or nullptr when none is set.
+    const std::shared_ptr<KvDeviceClient>& kv_device_client() const {
+        return kv_device_client_;
+    }
+
+    /**
      * @brief Heartbeat call to collect object-level statistics and retrieve the
      * set of non-offloaded objects.
      * @param enable_offloading Indicates whether offloading is enabled for this
@@ -1061,6 +1077,9 @@ class Client {
     ThreadPool write_thread_pool_;
     std::shared_ptr<StorageBackend> storage_backend_;
     std::shared_ptr<DistributedStorageBackend> dfs_storage_backend_;
+
+    // External KV-semantics storage device port (see SetKvDeviceClient).
+    std::shared_ptr<KvDeviceClient> kv_device_client_;
 
     // Probe used by healDanglingLocalDiskReplica to prove a completed
     // LOCAL_DISK replica's backing file is gone. Installed by the owner of
