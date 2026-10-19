@@ -27,6 +27,11 @@
 #include "count_min_sketch.h"
 #include "local_hot_cache.h"
 #include "pinned_buffer_pool.h"
+#include "kv_client_io.h"
+
+namespace kv {
+class KvClient;
+}
 
 namespace mooncake {
 
@@ -84,6 +89,29 @@ class Client {
 
     const UUID& getClientId() const { return client_id_; }
     const std::string& tenant_id() const { return master_client_.tenant_id(); }
+
+    /**
+     * Create and initialize the optional UCM KvClient from its SDK config.
+     * Requires USE_KVCLIENT at build time. Failure preserves any existing
+     * attachment. An attached SDK enables strict Put/BatchPut dual writes.
+     */
+    tl::expected<void, ErrorCode> InitKvClient(const std::string& config_path);
+
+    /**
+     * Attach an already initialized KvClient, or detach with nullptr.
+     * Configure before serving requests. This attachment owns SDK shutdown;
+     * do not share it with another independently managed Client attachment.
+     */
+    tl::expected<void, ErrorCode> SetKvClient(
+        std::shared_ptr<kv::KvClient> client);
+
+    /**
+     * Return an owning snapshot for direct access to the native SDK API.
+     * May return nullptr. Pointer ownership does not prevent SDK shutdown on
+     * detach; do not shut down or consume tasks belonging to this integration.
+     */
+    std::shared_ptr<kv::KvClient> GetKvClient() const;
+    bool HasKvClient() const;
 
     /**
      * @brief Creates and initializes a new Client instance
@@ -986,6 +1014,8 @@ class Client {
     void ComputeBatchObjectChecksums(std::vector<PutOperation>& ops);
     void StageWriteBuffersForRemoteReplicas(std::vector<PutOperation>& ops,
                                             const WriteBufferStager& stager);
+    void StartKvTransfers(std::vector<PutOperation>& ops,
+                          const std::shared_ptr<KvClientIO>& io);
     void SubmitTransfers(std::vector<PutOperation>& ops);
     void WaitForTransfers(std::vector<PutOperation>& ops);
     void SubmitDfsWrites(std::vector<PutOperation>& ops);
@@ -1016,6 +1046,10 @@ class Client {
     std::unique_ptr<ClientMetric> metrics_;
 
     // Core components
+    std::shared_ptr<KvClientIO> kv_io_;
+    // Configuration is changed only before serving requests. Atomic snapshots
+    // protect IO ownership; callers must not toggle storage policy mid-request.
+    std::shared_ptr<kv::KvClient> kv_client_;
     std::shared_ptr<TransferEngine> transfer_engine_;
     MasterClient master_client_;
     std::unique_ptr<TransferSubmitter> transfer_submitter_;

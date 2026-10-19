@@ -4,8 +4,33 @@
 #include "serializer.h"
 #include "serialize/serializer.h"
 #include "segment.h"
+#include "replica.h"
 
 namespace mooncake::test {
+
+TEST(KvReplicaSerializationTest,
+     PreservesGenerationInSnapshotAndWireDescriptor) {
+    const KvObjectInfo info{4096, {123, 456}};
+    Replica original(info, ReplicaStatus::COMPLETE);
+    SegmentView view(nullptr);  // KV replicas do not refer to memory segments.
+    msgpack::sbuffer buffer;
+    MsgpackPacker packer(&buffer);
+    ASSERT_TRUE(Serializer<Replica>::serialize(original, view, packer));
+    auto object = msgpack::unpack(buffer.data(), buffer.size());
+    auto restored = Serializer<Replica>::deserialize(object.get(), view);
+    ASSERT_TRUE(restored);
+    ASSERT_TRUE((*restored)->is_kv_replica());
+    EXPECT_EQ((*restored)->id(), original.id());
+    EXPECT_EQ((*restored)->get_kv_descriptor().generation, info.generation);
+    EXPECT_EQ((*restored)->get_kv_descriptor().object_size, info.object_size);
+
+    const auto descriptor = original.get_descriptor();
+    auto bytes = struct_pack::serialize(descriptor);
+    auto decoded = struct_pack::deserialize<Replica::Descriptor>(bytes);
+    ASSERT_TRUE(decoded);
+    ASSERT_TRUE(decoded->is_kv_replica());
+    EXPECT_EQ(decoded->get_kv_descriptor().generation, info.generation);
+}
 
 // Example class implementing serialization following the usage documentation
 class ExampleClass {

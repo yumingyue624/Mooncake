@@ -1,4 +1,5 @@
 #pragma once
+#include "kv_client_io.h"
 
 #include <glog/logging.h>
 
@@ -38,7 +39,8 @@ inline std::ostream& operator<<(std::ostream& os,
                              {ReplicaType::LOCAL_DISK, "LOCAL_DISK"},
                              {ReplicaType::NOF_SSD, "NOF_SSD"},
                              {ReplicaType::ALL, "ALL"},
-                             {ReplicaType::DFS, "DFS"}};
+                             {ReplicaType::DFS, "DFS"},
+                             {ReplicaType::KVCLIENT, "KVCLIENT"}};
 
     os << (replica_type_strings.count(replicaType)
                ? replica_type_strings.at(replicaType)
@@ -124,6 +126,9 @@ struct ReplicateConfig {
     // eviction treats the group as a unit (all-or-none). Object routing is
     // always hash(tenant, key) and is decoupled from groups.
     std::optional<std::vector<std::string>> group_ids{};
+    // Appended for wire tag stability. Only 0 or 1, with at least one memory
+    // replica. All participants must use a version supporting this extension.
+    size_t kv_replica_num{0};
 
     ReplicateConfig ForSingleKey(size_t key_index) const {
         ReplicateConfig key_config = *this;
@@ -190,12 +195,12 @@ enum class ReplicaWriteMode {
 
 inline ReplicaWriteMode DetermineReplicaWriteMode(
     const ReplicateConfig& config) {
-    if (config.dfs_replica_num == 0 && config.replica_num == 1 &&
-        config.nof_replica_num == 1) {
+    if (config.kv_replica_num == 0 && config.dfs_replica_num == 0 &&
+        config.replica_num == 1 && config.nof_replica_num == 1) {
         return ReplicaWriteMode::FLEXIBLE_DUAL_REPLICA;
     }
     if (config.replica_num > 1 || config.nof_replica_num > 1 ||
-        config.dfs_replica_num > 0) {
+        config.dfs_replica_num > 0 || config.kv_replica_num > 0) {
         return ReplicaWriteMode::RELIABLE_MULTI_REPLICA;
     }
     return ReplicaWriteMode::SINGLE_REPLICA;
@@ -238,6 +243,9 @@ struct DistributedFSDescriptor {
 
 struct DfsReplicaData {
     DistributedFSDescriptor descriptor;
+};
+struct KvReplicaData {
+    KvObjectInfo descriptor;
 };
 
 struct MemoryDescriptor {
@@ -292,6 +300,9 @@ class Replica {
 
     // dfs replica constructor
     Replica(DistributedFSDescriptor descriptor, ReplicaStatus status)
+        : Replica(next_id_.fetch_add(1), std::move(descriptor), status) {}
+
+    Replica(KvObjectInfo descriptor, ReplicaStatus status)
         : Replica(next_id_.fetch_add(1), std::move(descriptor), status) {}
 
     ~Replica() {
@@ -444,6 +455,13 @@ class Replica {
 
     [[nodiscard]] bool is_dfs_replica() const {
         return std::holds_alternative<DfsReplicaData>(data_);
+    }
+
+    [[nodiscard]] bool is_kv_replica() const {
+        return std::holds_alternative<KvReplicaData>(data_);
+    }
+    [[nodiscard]] const KvObjectInfo& get_kv_descriptor() const {
+        return std::get<KvReplicaData>(data_).descriptor;
     }
 
     [[nodiscard]] static bool fn_is_dfs_replica(const Replica& replica) {
@@ -619,6 +637,9 @@ class Replica {
     friend std::ostream& operator<<(std::ostream& os, const Replica& replica);
 
     struct ReplicaTypeVisitor {
+        ReplicaType operator()(const KvReplicaData&) const {
+            return ReplicaType::KVCLIENT;
+        }
         ReplicaType operator()(const MemoryReplicaData&) const {
             return ReplicaType::MEMORY;
         }
@@ -639,10 +660,18 @@ class Replica {
     struct Descriptor {
         ReplicaID id{0};
         std::variant<MemoryDescriptor, NoFDescriptor, DiskDescriptor,
-                     LocalDiskDescriptor, DistributedFSDescriptor>
+                     LocalDiskDescriptor, DistributedFSDescriptor, KvObjectInfo>
             descriptor_variant;
         ReplicaStatus status;
         YLT_REFL(Descriptor, id, descriptor_variant, status);
+
+        // Appended to preserve the existing descriptor variant tag IDs.
+        bool is_kv_replica() const noexcept {
+            return std::holds_alternative<KvObjectInfo>(descriptor_variant);
+        }
+        const KvObjectInfo& get_kv_descriptor() const {
+            return std::get<KvObjectInfo>(descriptor_variant);
+        }
 
         // Helper functions
         bool is_memory_replica() noexcept {
@@ -815,6 +844,12 @@ class Replica {
           status_(status),
           refcnt_(0) {}
 
+    Replica(ReplicaID id, KvObjectInfo descriptor, ReplicaStatus status)
+        : id_(id),
+          data_(KvReplicaData{std::move(descriptor)}),
+          status_(status),
+          refcnt_(0) {}
+
     // Process-wide and monotonic. Standby restores bump it past the max
     // restored id and never roll back: a failed restore keeps the counter
     // advanced so ids are never reused.
@@ -822,7 +857,7 @@ class Replica {
 
     ReplicaID id_;
     std::variant<MemoryReplicaData, NoFReplicaData, DiskReplicaData,
-                 LocalDiskReplicaData, DfsReplicaData>
+                 LocalDiskReplicaData, DfsReplicaData, KvReplicaData>
         data_;
     ReplicaStatus status_{ReplicaStatus::UNDEFINED};
 
@@ -875,6 +910,8 @@ inline Replica::Descriptor Replica::get_descriptor() const {
         desc.descriptor_variant = std::move(local_disk_desc);
     } else if (is_dfs_replica()) {
         desc.descriptor_variant = std::get<DfsReplicaData>(data_).descriptor;
+    } else if (is_kv_replica()) {
+        desc.descriptor_variant = get_kv_descriptor();
     }
 
     return desc;

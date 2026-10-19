@@ -110,7 +110,8 @@ uint64_t SaturatingMultiply(uint64_t lhs, uint64_t rhs) {
 bool HasExpectedReplicaAllocation(const ReplicateConfig& config,
                                   size_t allocated_memory_replicas,
                                   size_t allocated_nof_replicas) {
-    if (config.nof_replica_num == 0 && config.dfs_replica_num == 0) {
+    if (config.nof_replica_num == 0 && config.dfs_replica_num == 0 &&
+        config.kv_replica_num == 0) {
         return allocated_memory_replicas > 0;
     }
     if (DetermineReplicaWriteMode(config) ==
@@ -3571,6 +3572,9 @@ tl::expected<void, ErrorCode> MasterService::ConstructLegacyStandbyReplicas(
                 replicas.push_back(Replica(
                     desc.id, std::make_unique<AllocatedBuffer>(alloc, buffer),
                     desc.status, ReplicaType::NOF_SSD));
+            } else if (desc.is_kv_replica()) {
+                replicas.push_back(
+                    Replica(desc.id, desc.get_kv_descriptor(), desc.status));
             } else if (desc.is_disk_replica()) {
                 const auto& disk_desc = desc.get_disk_descriptor();
                 if (disk_desc.object_size != standby_meta.size) {
@@ -4040,6 +4044,9 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyState(
                     replicas.push_back(
                         Replica(desc.id, std::move(restored_buffer),
                                 desc.status, ReplicaType::NOF_SSD));
+                } else if (desc.is_kv_replica()) {
+                    replicas.push_back(Replica(
+                        desc.id, desc.get_kv_descriptor(), desc.status));
                 } else if (desc.is_disk_replica()) {
                     const auto& disk_desc = desc.get_disk_descriptor();
                     if (disk_desc.object_size != standby_meta.size) {
@@ -5309,6 +5316,11 @@ auto MasterService::AllocateReplicas(const std::string& key,
         replicas.emplace_back(std::move(*alloc), ReplicaStatus::PROCESSING);
     }
 
+    if (config.kv_replica_num > 0) {
+        replicas.emplace_back(KvObjectInfo{value_length, generate_uuid()},
+                              ReplicaStatus::PROCESSING);
+    }
+
     return replicas;
 }
 
@@ -5458,6 +5470,12 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
                    << ", dfs_replica_num=" << config.dfs_replica_num
                    << ", slice_length=" << slice_length
                    << ", key_size=" << key.size() << ", error=invalid_params";
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    if (config.kv_replica_num > 1 ||
+        (config.kv_replica_num > 0 &&
+         (config.replica_num == 0 || config.nof_replica_num != 0 ||
+          config.dfs_replica_num != 0))) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
     if (config.dfs_replica_num > 1 ||
@@ -5670,7 +5688,7 @@ auto MasterService::PutEnd(const UUID& client_id, const ObjectMeta& object_meta,
                     !replica.has_invalid_mem_handle()) ||
                    (replica.is_nof_replica() &&
                     !replica.has_invalid_nof_handle()) ||
-                   replica.is_dfs_replica();
+                   replica.is_dfs_replica() || replica.is_kv_replica();
         }
         if (replica_type == ReplicaType::MEMORY) {
             return replica.is_memory_replica() &&
@@ -5978,7 +5996,8 @@ auto MasterService::PutRevoke(const UUID& client_id, const std::string& key,
         metadata.GetFirstReplica([replica_type](const Replica& replica) {
             if (replica_type == ReplicaType::ALL) {
                 return (replica.is_memory_replica() ||
-                        replica.is_nof_replica() || replica.is_dfs_replica()) &&
+                        replica.is_nof_replica() || replica.is_dfs_replica() ||
+                        replica.is_kv_replica()) &&
                        !replica.is_processing();
             }
             return replica.type() == replica_type && !replica.is_processing();
@@ -5995,7 +6014,7 @@ auto MasterService::PutRevoke(const UUID& client_id, const std::string& key,
         }
         if (replica_type == ReplicaType::ALL) {
             return r.is_memory_replica() || r.is_nof_replica() ||
-                   r.is_dfs_replica();
+                   r.is_dfs_replica() || r.is_kv_replica();
         }
         return r.type() == replica_type;
     };
@@ -6131,6 +6150,8 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                                 const uint64_t slice_length,
                                 const ReplicateConfig& config)
     -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode> {
+    if (config.kv_replica_num > 0)
+        return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
     const auto object_id = MakeObjectIdentityForRequest(key, tenant_id);
     // --- Parameter validation (same as PutStart) ---
     if ((config.replica_num == 0 && config.nof_replica_num == 0 &&
@@ -6141,6 +6162,12 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                    << ", dfs_replica_num=" << config.dfs_replica_num
                    << ", slice_length=" << slice_length
                    << ", key_size=" << key.size() << ", error=invalid_params";
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    if (config.kv_replica_num > 1 ||
+        (config.kv_replica_num > 0 &&
+         (config.replica_num == 0 || config.nof_replica_num != 0 ||
+          config.dfs_replica_num != 0))) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
     if (config.dfs_replica_num > 1 ||
@@ -6275,6 +6302,9 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
             // --- Step 1: safety checks and preemption (only if key exists) ---
             if (it != tenant_state.metadata.end()) {
                 auto& metadata = it->second.metadata;
+                if (metadata.HasReplica(
+                        [](const Replica& r) { return r.is_kv_replica(); }))
+                    return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
                 auto& state = it->second.state;
 
                 // Reject if the caller tries to change group membership.
@@ -6386,6 +6416,9 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                 // --- Step 2: key exists with COMPLETE replicas → Case B or C
                 // ---
                 auto& metadata = it->second.metadata;
+                if (metadata.HasReplica(
+                        [](const Replica& r) { return r.is_kv_replica(); }))
+                    return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
 
                 // Reject if any reader holds a reference (refcnt > 0).
                 // Overwriting a buffer that an RDMA read is streaming from
@@ -7789,6 +7822,14 @@ tl::expected<void, ErrorCode> MasterService::MoveRevoke(
 
 auto MasterService::Remove(const std::string& key, const TenantId& tenant_id,
                            bool force) -> tl::expected<void, ErrorCode> {
+    auto result = RemoveWithKvReplicas(key, tenant_id, force);
+    if (!result) return tl::unexpected(result.error());
+    return {};
+}
+
+auto MasterService::RemoveWithKvReplicas(const std::string& key,
+                                         const TenantId& tenant_id, bool force)
+    -> tl::expected<std::vector<KvObjectInfo>, ErrorCode> {
     std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
     const auto object_id = MakeObjectIdentityForRequest(key, tenant_id);
     MetadataAccessorRW accessor(this, object_id);
@@ -7820,6 +7861,12 @@ auto MasterService::Remove(const std::string& key, const TenantId& tenant_id,
         return tl::make_unexpected(ErrorCode::OBJECT_HAS_REPLICATION_TASK);
     }
 
+    std::vector<KvObjectInfo> kv_replicas;
+    metadata.VisitReplicas([](const Replica& r) { return r.is_kv_replica(); },
+                           [&](const Replica& r) {
+                               kv_replicas.push_back(r.get_kv_descriptor());
+                           });
+
     if (enable_ha_) {
         if (enable_oplog_) {
             auto reservation = ReserveBatchOpLogSlot();
@@ -7843,11 +7890,11 @@ auto MasterService::Remove(const std::string& key, const TenantId& tenant_id,
             if (!persist_result) {
                 return tl::make_unexpected(persist_result.error());
             }
-            return {};
+            return kv_replicas;
         }
     }
     accessor.Erase();
-    return {};
+    return kv_replicas;
 }
 
 auto MasterService::RemoveByRegex(const std::string& regex_pattern,
@@ -13319,7 +13366,7 @@ std::vector<std::string> MasterService::KvMediaForMetadata(
                 has_disk = true;
             } else if (replica.is_disk_replica() ||
                        replica.is_local_disk_replica() ||
-                       replica.is_dfs_replica()) {
+                       replica.is_dfs_replica() || replica.is_kv_replica()) {
                 has_disk = true;
             }
         });
@@ -13353,7 +13400,7 @@ std::vector<std::string> MasterService::KvMediaForRemoval(
                 has_cpu = true;
             } else if (replica.is_nof_replica() || replica.is_disk_replica() ||
                        replica.is_local_disk_replica() ||
-                       replica.is_dfs_replica()) {
+                       replica.is_dfs_replica() || replica.is_kv_replica()) {
                 has_disk = true;
             }
         });

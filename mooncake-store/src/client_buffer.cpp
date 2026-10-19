@@ -143,6 +143,7 @@ std::vector<Slice> split_into_slices(void* buffer, size_t length) {
 }
 
 uint64_t calculate_total_size(const Replica::Descriptor& replica) {
+    if (replica.is_kv_replica()) return replica.get_kv_descriptor().object_size;
     uint64_t total_length = 0;
     if (replica.is_disk_replica()) {
         auto& disk_descriptor = replica.get_disk_descriptor();
@@ -161,7 +162,10 @@ uint64_t calculate_total_size(const Replica::Descriptor& replica) {
 
 int allocateSlices(std::vector<Slice>& slices,
                    const Replica::Descriptor& replica, void* buffer_ptr) {
-    if (replica.is_disk_replica()) {
+    if (replica.is_kv_replica()) {
+        slices.emplace_back(
+            Slice{buffer_ptr, replica.get_kv_descriptor().object_size});
+    } else if (replica.is_disk_replica()) {
         // For disk-based replica, split into slices based on file size
         uint64_t offset = 0;
         uint64_t total_length = replica.get_disk_descriptor().object_size;

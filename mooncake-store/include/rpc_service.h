@@ -150,6 +150,9 @@ class WrappedMasterService {
         const UUID& client_id, const std::vector<std::string>& keys,
         const std::string& tenant_id = "default");
 
+    tl::expected<std::vector<KvObjectInfo>, ErrorCode> RemoveWithKvReplicas(
+        const std::string& key, bool force = false,
+        const std::string& tenant_id = "default");
     tl::expected<void, ErrorCode> Remove(
         const std::string& key, bool force = false,
         const std::string& tenant_id = "default");

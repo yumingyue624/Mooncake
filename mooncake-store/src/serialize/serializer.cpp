@@ -764,6 +764,14 @@ tl::expected<void, SerializationError> Serializer<Replica>::serialize(
             packer.pack(local_data->transport_endpoint);
             break;
         }
+        case ReplicaType::KVCLIENT: {
+            const auto &info = replica.get_kv_descriptor();
+            packer.pack_array(3);
+            packer.pack(info.object_size);
+            packer.pack(info.generation.first);
+            packer.pack(info.generation.second);
+            break;
+        }
         case ReplicaType::DFS: {
             const auto *dfs_data = std::get_if<DfsReplicaData>(&replica.data_);
             if (!dfs_data) {
@@ -880,6 +888,20 @@ auto Serializer<Replica>::deserialize(const msgpack::object &obj,
 
             replica = std::make_shared<Replica>(
                 client_id, object_size, std::move(transport_endpoint), status);
+            break;
+        }
+        case static_cast<int8_t>(ReplicaType::KVCLIENT): {
+            const auto &payload = array_items[3];
+            if (payload.type != msgpack::type::ARRAY ||
+                payload.via.array.size != 3)
+                return tl::unexpected(
+                    SerializationError(ErrorCode::DESERIALIZE_FAIL,
+                                       "Invalid ASU replica snapshot"));
+            auto *fields = payload.via.array.ptr;
+            KvObjectInfo info{
+                fields[0].as<uint64_t>(),
+                {fields[1].as<uint64_t>(), fields[2].as<uint64_t>()}};
+            replica = std::make_shared<Replica>(info, status);
             break;
         }
         case static_cast<int8_t>(ReplicaType::DFS): {

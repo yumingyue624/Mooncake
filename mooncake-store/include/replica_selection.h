@@ -167,7 +167,7 @@ inline const Replica::Descriptor *SelectBestReplica(
             best = &r;  // LOCAL_DISK always overrides DFS and DISK
         } else if (r.is_dfs_replica()) {
             if (!best || !best->is_local_disk_replica()) best = &r;
-        } else if (r.is_disk_replica() && !best) {
+        } else if ((r.is_disk_replica() || r.is_kv_replica()) && !best) {
             best = &r;
         }
     }

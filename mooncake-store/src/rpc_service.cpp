@@ -896,6 +896,26 @@ WrappedMasterService::BatchUpsertRevoke(const UUID& client_id,
     return results;
 }
 
+tl::expected<std::vector<KvObjectInfo>, ErrorCode>
+WrappedMasterService::RemoveWithKvReplicas(const std::string& key, bool force,
+                                           const std::string& tenant_id) {
+    return execute_rpc(
+        "RemoveWithKvReplicas",
+        [&] {
+            return WithRequestTenant(
+                master_service_.IsTenantQuotaEnabled()
+                    ? std::string_view(tenant_id)
+                    : TenantId::kDefaultValue,
+                [&](const TenantId& resolved_tenant_id) {
+                    return master_service_.RemoveWithKvReplicas(
+                        key, resolved_tenant_id, force);
+                });
+        },
+        [&](auto& timer) { timer.LogRequest("key=", key, ", force=", force); },
+        [] { MasterMetricManager::instance().inc_remove_requests(); },
+        [] { MasterMetricManager::instance().inc_remove_failures(); });
+}
+
 tl::expected<void, ErrorCode> WrappedMasterService::Remove(
     const std::string& key, bool force, const std::string& tenant_id) {
     return execute_rpc(
@@ -1897,6 +1917,7 @@ void RegisterRpcService(coro_rpc::coro_rpc_server& server,
         &WrappedMasterService::BatchUpsertStart,
         &WrappedMasterService::BatchUpsertEnd,
         &WrappedMasterService::BatchUpsertRevoke, &WrappedMasterService::Remove,
+        &WrappedMasterService::RemoveWithKvReplicas,
         &WrappedMasterService::RemoveByRegex, &WrappedMasterService::RemoveAll,
         &WrappedMasterService::BatchRemove, &WrappedMasterService::MountSegment,
         &WrappedMasterService::MountNoFSegment,

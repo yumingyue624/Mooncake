@@ -1,5 +1,21 @@
 project(MooncakeStore VERSION 2.0.0)
 
+option(USE_KVCLIENT "Enable Client::InitKvClient with the external UCM SDK" OFF)
+if(USE_KVCLIENT)
+  find_path(KVCLIENT_INCLUDE_DIR kv_client.h)
+  find_library(KVCLIENT_LIBRARY NAMES kv_client)
+  if(NOT KVCLIENT_INCLUDE_DIR OR NOT KVCLIENT_LIBRARY)
+    message(
+      FATAL_ERROR
+        "USE_KVCLIENT requires KVCLIENT_INCLUDE_DIR and KVCLIENT_LIBRARY")
+  endif()
+  add_library(Mooncake::kvclient UNKNOWN IMPORTED)
+  set_target_properties(
+    Mooncake::kvclient
+    PROPERTIES IMPORTED_LOCATION "${KVCLIENT_LIBRARY}"
+               INTERFACE_INCLUDE_DIRECTORIES "${KVCLIENT_INCLUDE_DIR}")
+endif()
+
 set(MOONCAKE_STORE_INCLUDE_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/include")
 
 # Extract version components for C++ usage
