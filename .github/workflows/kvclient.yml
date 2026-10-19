@@ -43,6 +43,11 @@ jobs:
       - name: Run Client and snapshot tests
         run: |
           MOONCAKE_TEST_REAL_KVCLIENT_FAKE=1 ctest --test-dir build -R '^(client_kvclient_test|kvclient_dual_write_test|serializer_test)$' --timeout 180 --output-on-failure
+      - name: Verify the default build has no SDK dependency
+        run: |
+          cmake -S . -B build -DUSE_KVCLIENT=OFF
+          cmake --build build --target client_kvclient_test serializer_test -j2
+          ctest --test-dir build -R '^(client_kvclient_test|serializer_test)$' --timeout 180 --output-on-failure
       - uses: actions/cache/save@v4
         if: always() && steps.compiler-cache.outputs.cache-hit != 'true'
         with:

@@ -81,12 +81,15 @@ ASU garbage collection and capacity policy are not introduced by this PR.
 ## Validation
 
 ```sh
-ctest --test-dir build -R '^(client_kvclient_test|kvclient_dual_write_test)$' --output-on-failure
+ctest --test-dir build -R '^(client_kvclient_test|kvclient_dual_write_test|serializer_test)$' --output-on-failure
 ```
 
 The dual-write suite uses a real in-process Master and TCP memory transfer path
 with a fake implementing the actual public `kv::KvClient` contract. It checks
 write submission, multi-slice layout, both batch paths, failure revocation,
 cross-client ASU reads after memory removal, immutable duplicates and generation
-changes. The scoped CI workflow builds the real SDK with its CPU simulator and
-runs these targets. Real ASU hardware validation is a separate requirement.
+changes. The scoped CI workflow also creates clients from an SDK config file and
+roundtrips data through the real SDK's CPU FAKE Provider after the writer exits
+and memory is unmounted. It then rebuilds with SDK support disabled and runs the
+default-mode and snapshot tests. Real ASU hardware validation is a separate
+requirement.
