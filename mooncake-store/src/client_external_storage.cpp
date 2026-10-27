@@ -1,8 +1,6 @@
 #include "client_service.h"
-#include "external_store_operation.h"
 
 #include <cstdlib>
-#include <limits>
 #include <stdexcept>
 #include <glog/logging.h>
 #include "device/accelerator_registry.h"
@@ -10,27 +8,7 @@
 namespace mooncake {
 namespace {
 using Result = tl::expected<void, ErrorCode>;
-using Results = std::vector<Result>;
 
-bool Valid(const std::vector<ObjectKey>& keys,
-           const std::vector<std::vector<Slice>>& slices) {
-    if (keys.empty() || keys.size() != slices.size()) return false;
-    std::unordered_set<ObjectKey> seen;
-    for (size_t i = 0; i < keys.size(); ++i) {
-        if (keys[i].empty() || slices[i].empty() ||
-            !seen.insert(keys[i]).second)
-            return false;
-        size_t total = 0;
-        for (const auto& slice : slices[i]) {
-            if (!slice.ptr || !slice.size || slice.size > SIZE_MAX - total ||
-                slice.size >
-                    UINTPTR_MAX - reinterpret_cast<uintptr_t>(slice.ptr))
-                return false;
-            total += slice.size;
-        }
-    }
-    return true;
-}
 }  // namespace
 
 void Client::SetExternalStoreBackend(
@@ -83,76 +61,6 @@ tl::expected<void, ErrorCode> Client::RegisterExternalMemory(void* addr,
         return tl::unexpected(ErrorCode::INTERNAL_ERROR);
     external_regions_.emplace(addr, std::move(registered[0]));
     return {};
-}
-
-tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
-                                          std::vector<Slice>& slices,
-                                          const ReplicateConfig& config) {
-    if (!external_store_backend_) return PutNative(key, slices, config);
-    std::lock_guard<std::recursive_mutex> lock(external_store_mutex_);
-    if (!Valid({key}, {slices}))
-        return tl::unexpected(ErrorCode::INVALID_PARAMS);
-    return external_detail::Write(
-        *external_store_backend_, {key}, {slices}, external_wait_timeout_ms_,
-        true, [&] { return Results{PutNative(key, slices, config)}; })[0];
-}
-
-tl::expected<void, ErrorCode> Client::Upsert(const ObjectKey& key,
-                                             std::vector<Slice>& slices,
-                                             const ReplicateConfig& config) {
-    if (!external_store_backend_) return UpsertNative(key, slices, config);
-    std::lock_guard<std::recursive_mutex> lock(external_store_mutex_);
-    if (!Valid({key}, {slices}))
-        return tl::unexpected(ErrorCode::INVALID_PARAMS);
-    return external_detail::Write(
-        *external_store_backend_, {key}, {slices}, external_wait_timeout_ms_,
-        true, [&] { return Results{UpsertNative(key, slices, config)}; })[0];
-}
-
-std::vector<tl::expected<void, ErrorCode>> Client::BatchPut(
-    const std::vector<ObjectKey>& keys, std::vector<std::vector<Slice>>& slices,
-    const ReplicateConfig& config, const WriteBufferStager& stager) {
-    if (!external_store_backend_)
-        return BatchPutNative(keys, slices, config, stager);
-    std::lock_guard<std::recursive_mutex> lock(external_store_mutex_);
-    if (stager || !Valid(keys, slices)) {
-        return Results(keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
-    }
-    return external_detail::Write(
-        *external_store_backend_, keys, slices, external_wait_timeout_ms_,
-        false, [&] { return BatchPutNative(keys, slices, config, {}); });
-}
-
-std::vector<tl::expected<void, ErrorCode>> Client::BatchUpsert(
-    const std::vector<ObjectKey>& keys, std::vector<std::vector<Slice>>& slices,
-    const ReplicateConfig& config, const WriteBufferStager& stager) {
-    if (!external_store_backend_)
-        return BatchUpsertNative(keys, slices, config, stager);
-    std::lock_guard<std::recursive_mutex> lock(external_store_mutex_);
-    if (stager || !Valid(keys, slices)) {
-        return Results(keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
-    }
-    return external_detail::Write(
-        *external_store_backend_, keys, slices, external_wait_timeout_ms_,
-        false, [&] { return BatchUpsertNative(keys, slices, config, {}); });
-}
-
-tl::expected<void, ErrorCode> Client::Remove(const ObjectKey& key, bool force) {
-    if (!external_store_backend_) return RemoveNative(key, force);
-    std::lock_guard<std::recursive_mutex> lock(external_store_mutex_);
-    if (key.empty()) return tl::unexpected(ErrorCode::INVALID_KEY);
-    return external_detail::Remove(
-        *external_store_backend_, {key}, external_wait_timeout_ms_, true,
-        [&] { return Results{RemoveNative(key, force)}; })[0];
-}
-
-std::vector<tl::expected<void, ErrorCode>> Client::BatchRemove(
-    const std::vector<ObjectKey>& keys, bool force) {
-    if (!external_store_backend_) return BatchRemoveNative(keys, force);
-    std::lock_guard<std::recursive_mutex> lock(external_store_mutex_);
-    return external_detail::Remove(
-        *external_store_backend_, keys, external_wait_timeout_ms_, false,
-        [&] { return BatchRemoveNative(keys, force); });
 }
 
 }  // namespace mooncake

@@ -1,4 +1,5 @@
 #include "client_service.h"
+#include "external_store_operation.h"
 
 #include <boost/algorithm/string.hpp>
 #include <glog/logging.h>
@@ -1964,9 +1965,19 @@ bool Client::RedirectToHotCache(const std::string& key,
     return true;
 }
 
-tl::expected<void, ErrorCode> Client::PutNative(const ObjectKey& key,
-                                                std::vector<Slice>& slices,
-                                                const ReplicateConfig& config) {
+tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
+                                          std::vector<Slice>& slices,
+                                          const ReplicateConfig& config) {
+    std::unique_lock<std::recursive_mutex> external_lock(external_store_mutex_,
+                                                         std::defer_lock);
+    if (external_store_backend_) external_lock.lock();
+    external_detail::PendingExternal external(external_store_backend_.get(),
+                                              external_wait_timeout_ms_);
+    if (external_store_backend_ &&
+        !external_detail::ValidWrite({key}, {slices})) {
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
     std::optional<uint64_t> object_checksum;
     if (object_checksum_enabled_) {
         auto checksum_result = ComputeObjectChecksumForSlices(
@@ -1993,6 +2004,7 @@ tl::expected<void, ErrorCode> Client::PutNative(const ObjectKey& key,
     }
 
     // Start put operation
+    external.Put(key, slices);
     auto start_result = master_client_.PutStart(key, slice_lengths, client_cfg);
     if (!start_result &&
         start_result.error() == ErrorCode::OBJECT_ALREADY_EXISTS &&
@@ -2003,7 +2015,7 @@ tl::expected<void, ErrorCode> Client::PutNative(const ObjectKey& key,
         ErrorCode err = start_result.error();
         if (err == ErrorCode::OBJECT_ALREADY_EXISTS) {
             VLOG(1) << "object_already_exists key=" << key;
-            return {};
+            return external.Finish(tl::expected<void, ErrorCode>{});
         }
         if (err == ErrorCode::NO_AVAILABLE_HANDLE) {
             LOG(WARNING) << "Failed to start put operation for key=" << key
@@ -2012,7 +2024,7 @@ tl::expected<void, ErrorCode> Client::PutNative(const ObjectKey& key,
             LOG(ERROR) << "Failed to start put operation for key=" << key
                        << ": " << toString(err);
         }
-        return tl::unexpected(err);
+        return external.Finish(tl::unexpected(err));
     }
 
     ReplicaTransferSummary transfer_summary;
@@ -2102,7 +2114,7 @@ tl::expected<void, ErrorCode> Client::PutNative(const ObjectKey& key,
         if (!end_result) {
             ErrorCode err = end_result.error();
             LOG(ERROR) << "Failed to end put operation: " << err;
-            return tl::unexpected(err);
+            return external.Finish(tl::unexpected(err));
         }
     }
 
@@ -2111,15 +2123,15 @@ tl::expected<void, ErrorCode> Client::PutNative(const ObjectKey& key,
             master_client_.PutRevoke(key, *finalize_decision.revoke_type);
         if (!revoke_result) {
             LOG(ERROR) << "Failed to revoke put operation";
-            return tl::unexpected(revoke_result.error());
+            return external.Finish(tl::unexpected(revoke_result.error()));
         }
     }
 
     if (!finalize_decision.success) {
-        return tl::unexpected(finalize_decision.error);
+        return external.Finish(tl::unexpected(finalize_decision.error));
     }
 
-    return {};
+    return external.Finish(tl::expected<void, ErrorCode>{});
 }
 
 namespace {
@@ -2181,9 +2193,19 @@ Client::DiskReplicaHealResult Client::healDanglingLocalDiskReplica(
     return DiskReplicaHealResult::kEvicted;
 }
 
-tl::expected<void, ErrorCode> Client::UpsertNative(
-    const ObjectKey& key, std::vector<Slice>& slices,
-    const ReplicateConfig& config) {
+tl::expected<void, ErrorCode> Client::Upsert(const ObjectKey& key,
+                                             std::vector<Slice>& slices,
+                                             const ReplicateConfig& config) {
+    std::unique_lock<std::recursive_mutex> external_lock(external_store_mutex_,
+                                                         std::defer_lock);
+    if (external_store_backend_) external_lock.lock();
+    external_detail::PendingExternal external(external_store_backend_.get(),
+                                              external_wait_timeout_ms_);
+    if (external_store_backend_ &&
+        !external_detail::ValidWrite({key}, {slices})) {
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
     std::optional<uint64_t> object_checksum;
     if (object_checksum_enabled_) {
         auto checksum_result = ComputeObjectChecksumForSlices(
@@ -2210,6 +2232,7 @@ tl::expected<void, ErrorCode> Client::UpsertNative(
     }
 
     // Start upsert operation
+    external.Put(key, slices);
     auto start_result =
         master_client_.UpsertStart(key, slice_lengths, client_cfg);
     if (!start_result) {
@@ -2221,7 +2244,7 @@ tl::expected<void, ErrorCode> Client::UpsertNative(
             LOG(ERROR) << "Failed to start upsert operation for key=" << key
                        << ": " << toString(err);
         }
-        return tl::unexpected(err);
+        return external.Finish(tl::unexpected(err));
     }
 
     ReplicaTransferSummary transfer_summary;
@@ -2307,7 +2330,7 @@ tl::expected<void, ErrorCode> Client::UpsertNative(
         if (!end_result) {
             ErrorCode err = end_result.error();
             LOG(ERROR) << "Failed to end upsert operation: " << err;
-            return tl::unexpected(err);
+            return external.Finish(tl::unexpected(err));
         }
     }
     if (finalize_decision.revoke_type.has_value()) {
@@ -2315,11 +2338,11 @@ tl::expected<void, ErrorCode> Client::UpsertNative(
             master_client_.UpsertRevoke(key, *finalize_decision.revoke_type);
         if (!revoke_result) {
             LOG(ERROR) << "Failed to revoke upsert operation";
-            return tl::unexpected(revoke_result.error());
+            return external.Finish(tl::unexpected(revoke_result.error()));
         }
     }
     if (!finalize_decision.success) {
-        return tl::unexpected(finalize_decision.error);
+        return external.Finish(tl::unexpected(finalize_decision.error));
     }
 
     // Success-side invalidation: a concurrent read between the pre-upsert
@@ -2330,7 +2353,7 @@ tl::expected<void, ErrorCode> Client::UpsertNative(
         hot_cache_->RemoveHotKey(key);
     }
 
-    return {};
+    return external.Finish(tl::expected<void, ErrorCode>{});
 }
 
 // TODO: `client.cpp` is too long, consider split it into multiple files
@@ -3585,10 +3608,21 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPut(
     return BatchPut(keys, batched_slices, config, {});
 }
 
-std::vector<tl::expected<void, ErrorCode>> Client::BatchPutNative(
+std::vector<tl::expected<void, ErrorCode>> Client::BatchPut(
     const std::vector<ObjectKey>& keys,
     std::vector<std::vector<Slice>>& batched_slices,
     const ReplicateConfig& config, const WriteBufferStager& stager) {
+    std::unique_lock<std::recursive_mutex> external_lock(external_store_mutex_,
+                                                         std::defer_lock);
+    if (external_store_backend_) external_lock.lock();
+    external_detail::PendingExternal external(external_store_backend_.get(),
+                                              external_wait_timeout_ms_);
+    if (external_store_backend_ &&
+        (stager || !external_detail::ValidWrite(keys, batched_slices))) {
+        return std::vector<tl::expected<void, ErrorCode>>(
+            keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
+    }
+
     ReplicateConfig client_cfg = AttachHostId(config);
     if (protocol_ == "cxl") {
         client_cfg.preferred_segment = local_hostname_;
@@ -3600,10 +3634,12 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPutNative(
             return std::vector<tl::expected<void, ErrorCode>>(
                 keys.size(), tl::unexpected(*err));
         }
+        external.BatchPut(keys, batched_slices);
         StartBatchPut(ops, client_cfg);
         StageWriteBuffersForRemoteReplicas(ops, stager);
-        return BatchWriteWhenPreferSameNode(ops, false);
+        return external.Finish(BatchWriteWhenPreferSameNode(ops, false));
     }
+    external.BatchPut(keys, batched_slices);
     StartBatchPut(ops, client_cfg);
     StageWriteBuffersForRemoteReplicas(ops, stager);
 
@@ -3619,7 +3655,7 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPutNative(
     }
 
     FinalizeBatchPut(ops);
-    return CollectResults(ops);
+    return external.Finish(CollectResults(ops));
 }
 
 // Defined after PutOperation: std::vector<PutOperation> must be instantiated
@@ -3631,10 +3667,21 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchUpsert(
     return BatchUpsert(keys, batched_slices, config, {});
 }
 
-std::vector<tl::expected<void, ErrorCode>> Client::BatchUpsertNative(
+std::vector<tl::expected<void, ErrorCode>> Client::BatchUpsert(
     const std::vector<ObjectKey>& keys,
     std::vector<std::vector<Slice>>& batched_slices,
     const ReplicateConfig& config, const WriteBufferStager& stager) {
+    std::unique_lock<std::recursive_mutex> external_lock(external_store_mutex_,
+                                                         std::defer_lock);
+    if (external_store_backend_) external_lock.lock();
+    external_detail::PendingExternal external(external_store_backend_.get(),
+                                              external_wait_timeout_ms_);
+    if (external_store_backend_ &&
+        (stager || !external_detail::ValidWrite(keys, batched_slices))) {
+        return std::vector<tl::expected<void, ErrorCode>>(
+            keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
+    }
+
     ReplicateConfig client_cfg = AttachHostId(config);
     if (protocol_ == "cxl") {
         client_cfg.preferred_segment = local_hostname_;
@@ -3646,11 +3693,13 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchUpsertNative(
             return std::vector<tl::expected<void, ErrorCode>>(
                 keys.size(), tl::unexpected(*err));
         }
+        external.BatchPut(keys, batched_slices);
         StartBatchUpsert(ops, client_cfg);
         StageWriteBuffersForRemoteReplicas(ops, stager);
-        return BatchWriteWhenPreferSameNode(ops, true);
+        return external.Finish(BatchWriteWhenPreferSameNode(ops, true));
     }
 
+    external.BatchPut(keys, batched_slices);
     StartBatchUpsert(ops, client_cfg);
     StageWriteBuffersForRemoteReplicas(ops, stager);
     auto t0 = std::chrono::steady_clock::now();
@@ -3665,7 +3714,7 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchUpsertNative(
     }
 
     FinalizeBatchUpsert(ops);
-    return CollectResults(ops);
+    return external.Finish(CollectResults(ops));
 }
 
 std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
@@ -3717,24 +3766,30 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPutRevoke(
     return master_client_.BatchPutRevoke(keys, replica_type);
 }
 
-tl::expected<void, ErrorCode> Client::RemoveNative(const ObjectKey& key,
-                                                   bool force) {
+tl::expected<void, ErrorCode> Client::Remove(const ObjectKey& key, bool force) {
+    std::unique_lock<std::recursive_mutex> external_lock(external_store_mutex_,
+                                                         std::defer_lock);
+    if (external_store_backend_) external_lock.lock();
+    external_detail::PendingExternal external(external_store_backend_.get(),
+                                              external_wait_timeout_ms_);
+
     if (hot_cache_) {
         hot_cache_->BumpKeyGeneration(key);
     }
 
+    external.Remove(key);
     auto result = master_client_.Remove(key, force);
     // if (storage_backend_) {
     //     storage_backend_->RemoveFile(key);
     // }
     if (!result) {
-        return tl::unexpected(result.error());
+        return external.Finish(tl::unexpected(result.error()));
     }
     if (hot_cache_) {
         hot_cache_->RemoveHotKey(key);
     }
 
-    return {};
+    return external.Finish(tl::expected<void, ErrorCode>{});
 }
 
 tl::expected<long, ErrorCode> Client::RemoveByRegex(const ObjectKey& str,
@@ -3780,12 +3835,19 @@ tl::expected<long, ErrorCode> Client::RemoveAll(bool force) {
     return result;
 }
 
-std::vector<tl::expected<void, ErrorCode>> Client::BatchRemoveNative(
+std::vector<tl::expected<void, ErrorCode>> Client::BatchRemove(
     const std::vector<ObjectKey>& keys, bool force) {
+    std::unique_lock<std::recursive_mutex> external_lock(external_store_mutex_,
+                                                         std::defer_lock);
+    if (external_store_backend_) external_lock.lock();
+    external_detail::PendingExternal external(external_store_backend_.get(),
+                                              external_wait_timeout_ms_);
+
     if (hot_cache_) {
         hot_cache_->BumpKeyGenerations(keys);
     }
 
+    external.BatchRemove(keys);
     auto results = master_client_.BatchRemove(keys, force);
 
     if (hot_cache_) {
@@ -3801,7 +3863,7 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchRemoveNative(
         }
     }
 
-    return results;
+    return external.Finish(results);
 }
 
 tl::expected<void, ErrorCode> Client::EvictDiskReplica(

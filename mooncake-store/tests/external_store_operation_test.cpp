@@ -1,6 +1,7 @@
 #include "external_store_operation.h"
 
 #include <iostream>
+#include <functional>
 #include <stdexcept>
 #include <string>
 
@@ -38,15 +39,6 @@ class FakeBackend final : public ExternalStoreBackend {
         events += "W";
         return results;
     }
-    tl::expected<void, ErrorCode> RegisterRegions(
-        const std::vector<MemoryRegion>&,
-        std::vector<std::shared_ptr<const StorageBuffer>>&) override {
-        return {};
-    }
-    tl::expected<void, ErrorCode> UnregisterRegions(
-        const std::vector<std::shared_ptr<const StorageBuffer>>&) override {
-        return {};
-    }
 
    private:
     tl::expected<void*, ErrorCode> Submit() {
@@ -56,6 +48,30 @@ class FakeBackend final : public ExternalStoreBackend {
     }
 };
 
+static Results RunWrite(ExternalStoreBackend& backend,
+                        const std::vector<ObjectKey>& keys,
+                        const std::vector<std::vector<Slice>>& slices,
+                        uint64_t timeout, bool single,
+                        const std::function<Results()>& native) {
+    external_detail::PendingExternal pending(&backend, timeout);
+    if (single)
+        pending.Put(keys[0], slices[0]);
+    else
+        pending.BatchPut(keys, slices);
+    return pending.Finish(native());
+}
+
+static Results RunRemove(ExternalStoreBackend& backend,
+                         const std::vector<ObjectKey>& keys, uint64_t timeout,
+                         bool single, const std::function<Results()>& native) {
+    external_detail::PendingExternal pending(&backend, timeout);
+    if (single)
+        pending.Remove(keys[0]);
+    else
+        pending.BatchRemove(keys);
+    return pending.Finish(native());
+}
+
 int main() {
     int data = 0;
     const std::vector<ObjectKey> keys{"A", "B", "C", "D"};
@@ -64,7 +80,7 @@ int main() {
         tl::expected<void, ErrorCode>{tl::unexpected(ErrorCode::WRITE_FAIL)};
     FakeBackend backend;
     backend.results = {{}, error, {}, error};
-    auto result = external_detail::Write(backend, keys, slices, 1, false, [&] {
+    auto result = RunWrite(backend, keys, slices, 1, false, [&] {
         backend.events += "N";
         return Results{{}, {}, error, error};
     });
@@ -73,7 +89,7 @@ int main() {
             !result[3]);
 
     backend.events.clear();
-    auto removed = external_detail::Remove(backend, keys, 1, false, [&] {
+    auto removed = RunRemove(backend, keys, 1, false, [&] {
         backend.events += "N";
         return Results{error, {}, error, {}};
     });
@@ -82,11 +98,10 @@ int main() {
 
     backend.events.clear();
     try {
-        external_detail::Write(backend, keys, slices, 1, false,
-                               [&]() -> Results {
-                                   backend.events += "N";
-                                   throw std::runtime_error("native exception");
-                               });
+        RunWrite(backend, keys, slices, 1, false, [&]() -> Results {
+            backend.events += "N";
+            throw std::runtime_error("native exception");
+        });
         Require(false);
     } catch (const std::runtime_error&) {
         Require(backend.events == "SNW");
@@ -94,7 +109,7 @@ int main() {
 
     backend.events.clear();
     backend.reject = true;
-    result = external_detail::Write(backend, keys, slices, 1, false, [&] {
+    result = RunWrite(backend, keys, slices, 1, false, [&] {
         backend.events += "N";
         return Results{{}, error, {}, error};
     });
@@ -104,8 +119,19 @@ int main() {
     backend.reject = false;
     backend
         .results = {};  // Malformed backend response must not invent success.
-    result = external_detail::Write(backend, keys, slices, 1, false,
-                                    [&] { return Results(4, error); });
+    result = RunWrite(backend, keys, slices, 1, false,
+                      [&] { return Results(4, error); });
     for (const auto& entry : result) Require(!entry);
+    backend.results = {{}};
+    {
+        external_detail::PendingExternal pending(&backend, 1);
+        pending.Put("single", {{&data, sizeof(data)}});
+        Require(bool(pending.Finish(tl::unexpected(ErrorCode::WRITE_FAIL))));
+    }
+    {
+        external_detail::PendingExternal pending(nullptr, 1);
+        pending.Put("native-only", {{&data, sizeof(data)}});
+        Require(!pending.Finish(tl::unexpected(ErrorCode::WRITE_FAIL)));
+    }
     std::cout << "external operation tests passed\n";
 }

@@ -883,21 +883,6 @@ class Client {
 
    private:
     tl::expected<void, ErrorCode> InitExternalStoreBackend();
-    tl::expected<void, ErrorCode> PutNative(const ObjectKey&,
-                                            std::vector<Slice>&,
-                                            const ReplicateConfig&);
-    tl::expected<void, ErrorCode> UpsertNative(const ObjectKey&,
-                                               std::vector<Slice>&,
-                                               const ReplicateConfig&);
-    std::vector<tl::expected<void, ErrorCode>> BatchPutNative(
-        const std::vector<ObjectKey>&, std::vector<std::vector<Slice>>&,
-        const ReplicateConfig&, const WriteBufferStager&);
-    std::vector<tl::expected<void, ErrorCode>> BatchUpsertNative(
-        const std::vector<ObjectKey>&, std::vector<std::vector<Slice>>&,
-        const ReplicateConfig&, const WriteBufferStager&);
-    tl::expected<void, ErrorCode> RemoveNative(const ObjectKey&, bool);
-    std::vector<tl::expected<void, ErrorCode>> BatchRemoveNative(
-        const std::vector<ObjectKey>&, bool);
     std::shared_ptr<ExternalStoreBackend> external_store_backend_;
     uint64_t external_wait_timeout_ms_ = 30000;
     // A first implementation serializes this client's writes, deletes and MR
