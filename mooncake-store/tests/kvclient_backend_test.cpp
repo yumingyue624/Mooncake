@@ -123,6 +123,21 @@ TEST(KVClientBackendTest, DeletePreservesInputOrderAndTenantIsolation) {
     EXPECT_EQ(backend.Wait(*task, 100)[0].error(), ErrorCode::INVALID_PARAMS);
 }
 
+TEST(KVClientBackendTest, DuplicateKeysRetainTheirInputPositions) {
+    auto sdk = std::make_shared<FakeSdk>();
+    KVClientBackend backend(sdk);
+    auto task = backend.BatchRemove("tenant-a", {"A", "", "A"});
+    ASSERT_TRUE(task);
+    ASSERT_EQ(sdk->removed.size(), 2);
+    EXPECT_EQ(sdk->removed[0], sdk->removed[1]);
+    auto results = backend.Wait(*task, 100);
+    ASSERT_EQ(results.size(), 3);
+    EXPECT_TRUE(results[0]);
+    ASSERT_FALSE(results[1]);
+    EXPECT_EQ(results[1].error(), ErrorCode::INVALID_KEY);
+    EXPECT_TRUE(results[2]);
+}
+
 TEST(KVClientBackendTest, RejectedSubmissionDoesNotWaitOnInvalidTaskId) {
     auto sdk = std::make_shared<FakeSdk>();
     KVClientBackend backend(sdk);

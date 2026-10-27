@@ -106,26 +106,6 @@ std::vector<tl::expected<void, ErrorCode>> MergeExternalPutResults(
     return native;
 }
 
-bool ValidateExternalWrite(const std::vector<ObjectKey>& keys,
-                           const std::vector<std::vector<Slice>>& slices) {
-    if (keys.empty() || keys.size() != slices.size()) return false;
-    std::unordered_set<ObjectKey> seen;
-    for (size_t i = 0; i < keys.size(); ++i) {
-        if (keys[i].empty() || slices[i].empty() ||
-            !seen.insert(keys[i]).second)
-            return false;
-        size_t total = 0;
-        for (const auto& slice : slices[i]) {
-            if (!slice.ptr || !slice.size || slice.size > SIZE_MAX - total ||
-                slice.size >
-                    UINTPTR_MAX - reinterpret_cast<uintptr_t>(slice.ptr))
-                return false;
-            total += slice.size;
-        }
-    }
-    return true;
-}
-
 constexpr size_t kObjectChecksumD2HChunkSize = 8 * 1024 * 1024;
 constexpr auto kInitialLeaderReadyTimeout = std::chrono::seconds(30);
 
@@ -2032,10 +2012,6 @@ bool Client::RedirectToHotCache(const std::string& key,
 tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
                                           std::vector<Slice>& slices,
                                           const ReplicateConfig& config) {
-    if (external_store_backend_ && !ValidateExternalWrite({key}, {slices})) {
-        return tl::unexpected(ErrorCode::INVALID_PARAMS);
-    }
-
     std::optional<uint64_t> object_checksum;
     if (object_checksum_enabled_) {
         auto checksum_result = ComputeObjectChecksumForSlices(
@@ -2282,10 +2258,6 @@ Client::DiskReplicaHealResult Client::healDanglingLocalDiskReplica(
 tl::expected<void, ErrorCode> Client::Upsert(const ObjectKey& key,
                                              std::vector<Slice>& slices,
                                              const ReplicateConfig& config) {
-    if (external_store_backend_ && !ValidateExternalWrite({key}, {slices})) {
-        return tl::unexpected(ErrorCode::INVALID_PARAMS);
-    }
-
     std::optional<uint64_t> object_checksum;
     if (object_checksum_enabled_) {
         auto checksum_result = ComputeObjectChecksumForSlices(
@@ -3720,8 +3692,8 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPut(
     const std::vector<ObjectKey>& keys,
     std::vector<std::vector<Slice>>& batched_slices,
     const ReplicateConfig& config, const WriteBufferStager& stager) {
-    if (external_store_backend_ &&
-        (stager || !ValidateExternalWrite(keys, batched_slices))) {
+    if (keys.size() != batched_slices.size() ||
+        (external_store_backend_ && stager)) {
         return std::vector<tl::expected<void, ErrorCode>>(
             keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
     }
@@ -3806,8 +3778,8 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchUpsert(
     const std::vector<ObjectKey>& keys,
     std::vector<std::vector<Slice>>& batched_slices,
     const ReplicateConfig& config, const WriteBufferStager& stager) {
-    if (external_store_backend_ &&
-        (stager || !ValidateExternalWrite(keys, batched_slices))) {
+    if (keys.size() != batched_slices.size() ||
+        (external_store_backend_ && stager)) {
         return std::vector<tl::expected<void, ErrorCode>>(
             keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
     }

@@ -108,6 +108,22 @@ TEST(ObjectChecksumTest, BatchPutStopsAfterChecksumPrecomputeFailure) {
     EXPECT_EQ(results[0].error(), ErrorCode::INVALID_PARAMS);
 }
 
+TEST(ClientWriteValidationTest, RejectsMismatchedBatchSizesBeforeNativeWork) {
+    ObjectChecksumClient client;
+    const std::vector<ObjectKey> keys{"a", "b"};
+    std::vector<std::vector<Slice>> slices(1);
+    auto put = client.BatchPut(keys, slices, ReplicateConfig{});
+    auto upsert = client.BatchUpsert(keys, slices, ReplicateConfig{});
+    ASSERT_EQ(put.size(), keys.size());
+    ASSERT_EQ(upsert.size(), keys.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        ASSERT_FALSE(put[i]);
+        ASSERT_FALSE(upsert[i]);
+        EXPECT_EQ(put[i].error(), ErrorCode::INVALID_PARAMS);
+        EXPECT_EQ(upsert[i].error(), ErrorCode::INVALID_PARAMS);
+    }
+}
+
 class ClientIdCaptureSink : public google::LogSink {
    public:
     std::string captured_client_id;
@@ -403,6 +419,33 @@ TEST_F(ClientIntegrationTest, ExternalPutMergesResultsPerKey) {
     ASSERT_EQ(native_failure.size(), 2);
     EXPECT_TRUE(native_failure[0]);
     EXPECT_FALSE(native_failure[1]);
+    EXPECT_EQ(backend->waits, 2);
+}
+
+TEST_F(ClientIntegrationTest, InvalidAndDuplicateKeysDoNotRejectWholeBatch) {
+    auto backend = std::make_shared<FakeExternalBackend>();
+    backend->results = {{}, tl::unexpected(ErrorCode::INVALID_KEY), {}};
+    void* buffer = client_buffer_allocator_->allocate(512);
+    memset(buffer, 0, 512);
+    const std::vector<ObjectKey> keys{"external-duplicate", "",
+                                      "external-duplicate"};
+    std::vector<std::vector<Slice>> slices{
+        {{buffer, 512}}, {}, {{buffer, 512}}};
+    ReplicateConfig config;
+    config.replica_num = 0;
+    test_client_->SetExternalStoreBackend(backend);
+    auto put = test_client_->BatchPut(keys, slices, config);
+    auto upsert = test_client_->BatchUpsert(keys, slices, config);
+    test_client_->SetExternalStoreBackend(nullptr);
+    client_buffer_allocator_->deallocate(buffer, 512);
+    ASSERT_EQ(put.size(), 3);
+    ASSERT_EQ(upsert.size(), 3);
+    EXPECT_TRUE(put[0]);
+    EXPECT_FALSE(put[1]);
+    EXPECT_TRUE(put[2]);
+    EXPECT_TRUE(upsert[0]);
+    EXPECT_FALSE(upsert[1]);
+    EXPECT_TRUE(upsert[2]);
     EXPECT_EQ(backend->waits, 2);
 }
 
