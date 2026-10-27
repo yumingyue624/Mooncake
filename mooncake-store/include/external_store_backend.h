@@ -46,11 +46,6 @@ class ExternalStoreBackend {
     // input order. Return only once the source is no longer being accessed.
     virtual std::vector<tl::expected<void, ErrorCode>> Wait(
         void* task, uint64_t timeout_ms) = 0;
-    virtual tl::expected<void, ErrorCode> RegisterRegions(
-        const std::vector<MemoryRegion>&,
-        std::vector<std::shared_ptr<const StorageBuffer>>&) = 0;
-    virtual tl::expected<void, ErrorCode> UnregisterRegions(
-        const std::vector<std::shared_ptr<const StorageBuffer>>&) = 0;
 };
 
 // Empty path selects native-only. An unknown/unavailable backend fails startup.

@@ -29,11 +29,6 @@ class KVClientBackend final : public ExternalStoreBackend {
     tl::expected<void*, ErrorCode> BatchRemove(
         const std::vector<ObjectKey>&) override;
     std::vector<tl::expected<void, ErrorCode>> Wait(void*, uint64_t) override;
-    tl::expected<void, ErrorCode> RegisterRegions(
-        const std::vector<MemoryRegion>&,
-        std::vector<std::shared_ptr<const StorageBuffer>>&) override;
-    tl::expected<void, ErrorCode> UnregisterRegions(
-        const std::vector<std::shared_ptr<const StorageBuffer>>&) override;
 
    private:
     struct Impl;
