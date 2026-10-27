@@ -27,6 +27,7 @@
 #include "count_min_sketch.h"
 #include "local_hot_cache.h"
 #include "pinned_buffer_pool.h"
+#include "external_store_backend.h"
 
 namespace mooncake {
 
@@ -84,6 +85,15 @@ class Client {
 
     const UUID& getClientId() const { return client_id_; }
     const std::string& tenant_id() const { return master_client_.tenant_id(); }
+
+    // Configure before registering buffers or serving requests.
+    void SetExternalStoreBackend(std::shared_ptr<ExternalStoreBackend> backend,
+                                 uint64_t wait_timeout_ms = 30000);
+    bool HasExternalStoreBackend() const {
+        return bool(external_store_backend_);
+    }
+    tl::expected<void, ErrorCode> RegisterExternalMemory(void* addr,
+                                                         size_t size);
 
     /**
      * @brief Creates and initializes a new Client instance
@@ -872,6 +882,29 @@ class Client {
                                     uint64_t quota_bytes = 0);
 
    private:
+    tl::expected<void, ErrorCode> InitExternalStoreBackend();
+    tl::expected<void, ErrorCode> PutNative(const ObjectKey&,
+                                            std::vector<Slice>&,
+                                            const ReplicateConfig&);
+    tl::expected<void, ErrorCode> UpsertNative(const ObjectKey&,
+                                               std::vector<Slice>&,
+                                               const ReplicateConfig&);
+    std::vector<tl::expected<void, ErrorCode>> BatchPutNative(
+        const std::vector<ObjectKey>&, std::vector<std::vector<Slice>>&,
+        const ReplicateConfig&, const WriteBufferStager&);
+    std::vector<tl::expected<void, ErrorCode>> BatchUpsertNative(
+        const std::vector<ObjectKey>&, std::vector<std::vector<Slice>>&,
+        const ReplicateConfig&, const WriteBufferStager&);
+    tl::expected<void, ErrorCode> RemoveNative(const ObjectKey&, bool);
+    std::vector<tl::expected<void, ErrorCode>> BatchRemoveNative(
+        const std::vector<ObjectKey>&, bool);
+    std::shared_ptr<ExternalStoreBackend> external_store_backend_;
+    uint64_t external_wait_timeout_ms_ = 30000;
+    // A first implementation serializes this client's writes, deletes and MR
+    // lifecycle. It does not impose ordering across different clients.
+    std::recursive_mutex external_store_mutex_;
+    std::unordered_map<void*, std::shared_ptr<const StorageBuffer>>
+        external_regions_;
     /**
      * @brief Internal helper functions for initialization and data transfer
      */

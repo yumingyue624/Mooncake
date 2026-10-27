@@ -479,6 +479,7 @@ Client::Client(const std::string& local_hostname,
 }
 
 Client::~Client() {
+    external_store_backend_.reset();
     task_poll_running_ = false;
     if (task_poll_thread_.joinable()) {
         task_poll_thread_.join();
@@ -1136,6 +1137,12 @@ std::optional<std::shared_ptr<Client>> Client::Create(
 
     // this only performs RPC calls
     if (protocol == "rpc_only") {
+        const char* external_config =
+            std::getenv("MOONCAKE_EXTERNAL_STORE_CONFIG");
+        if (external_config && *external_config) {
+            LOG(ERROR) << "External store requires a transfer-capable Client";
+            return std::nullopt;
+        }
         LOG(INFO) << "Use rpc only. Skip initializing transfer engine.";
         return client;
     }
@@ -1162,6 +1169,7 @@ std::optional<std::shared_ptr<Client>> Client::Create(
         LOG(ERROR) << "Failed to initialize local hot cache";
     }
 
+    if (!client->InitExternalStoreBackend()) return std::nullopt;
     return client;
 }
 
@@ -1956,9 +1964,9 @@ bool Client::RedirectToHotCache(const std::string& key,
     return true;
 }
 
-tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
-                                          std::vector<Slice>& slices,
-                                          const ReplicateConfig& config) {
+tl::expected<void, ErrorCode> Client::PutNative(const ObjectKey& key,
+                                                std::vector<Slice>& slices,
+                                                const ReplicateConfig& config) {
     std::optional<uint64_t> object_checksum;
     if (object_checksum_enabled_) {
         auto checksum_result = ComputeObjectChecksumForSlices(
@@ -2173,9 +2181,9 @@ Client::DiskReplicaHealResult Client::healDanglingLocalDiskReplica(
     return DiskReplicaHealResult::kEvicted;
 }
 
-tl::expected<void, ErrorCode> Client::Upsert(const ObjectKey& key,
-                                             std::vector<Slice>& slices,
-                                             const ReplicateConfig& config) {
+tl::expected<void, ErrorCode> Client::UpsertNative(
+    const ObjectKey& key, std::vector<Slice>& slices,
+    const ReplicateConfig& config) {
     std::optional<uint64_t> object_checksum;
     if (object_checksum_enabled_) {
         auto checksum_result = ComputeObjectChecksumForSlices(
@@ -3577,7 +3585,7 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPut(
     return BatchPut(keys, batched_slices, config, {});
 }
 
-std::vector<tl::expected<void, ErrorCode>> Client::BatchPut(
+std::vector<tl::expected<void, ErrorCode>> Client::BatchPutNative(
     const std::vector<ObjectKey>& keys,
     std::vector<std::vector<Slice>>& batched_slices,
     const ReplicateConfig& config, const WriteBufferStager& stager) {
@@ -3623,7 +3631,7 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchUpsert(
     return BatchUpsert(keys, batched_slices, config, {});
 }
 
-std::vector<tl::expected<void, ErrorCode>> Client::BatchUpsert(
+std::vector<tl::expected<void, ErrorCode>> Client::BatchUpsertNative(
     const std::vector<ObjectKey>& keys,
     std::vector<std::vector<Slice>>& batched_slices,
     const ReplicateConfig& config, const WriteBufferStager& stager) {
@@ -3664,6 +3672,11 @@ std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
 Client::StartBatchPutForSizes(const std::vector<std::string>& keys,
                               const std::vector<uint64_t>& object_sizes,
                               const ReplicateConfig& config) {
+    if (external_store_backend_) {
+        return std::vector<
+            tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>(
+            keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
+    }
     std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
         results(keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
     if (keys.size() != object_sizes.size()) {
@@ -3704,7 +3717,8 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPutRevoke(
     return master_client_.BatchPutRevoke(keys, replica_type);
 }
 
-tl::expected<void, ErrorCode> Client::Remove(const ObjectKey& key, bool force) {
+tl::expected<void, ErrorCode> Client::RemoveNative(const ObjectKey& key,
+                                                   bool force) {
     if (hot_cache_) {
         hot_cache_->BumpKeyGeneration(key);
     }
@@ -3725,6 +3739,9 @@ tl::expected<void, ErrorCode> Client::Remove(const ObjectKey& key, bool force) {
 
 tl::expected<long, ErrorCode> Client::RemoveByRegex(const ObjectKey& str,
                                                     bool force) {
+    if (external_store_backend_) {
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
     if (hot_cache_) {
         hot_cache_->BumpCacheEpoch();
     }
@@ -3744,6 +3761,9 @@ tl::expected<long, ErrorCode> Client::RemoveByRegex(const ObjectKey& str,
 }
 
 tl::expected<long, ErrorCode> Client::RemoveAll(bool force) {
+    if (external_store_backend_) {
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
     if (hot_cache_) {
         hot_cache_->BumpCacheEpoch();
     }
@@ -3760,7 +3780,7 @@ tl::expected<long, ErrorCode> Client::RemoveAll(bool force) {
     return result;
 }
 
-std::vector<tl::expected<void, ErrorCode>> Client::BatchRemove(
+std::vector<tl::expected<void, ErrorCode>> Client::BatchRemoveNative(
     const std::vector<ObjectKey>& keys, bool force) {
     if (hot_cache_) {
         hot_cache_->BumpKeyGenerations(keys);
@@ -4072,6 +4092,7 @@ void Client::OnGracefulUnmountTimer(const UUID& segment_id, int retry_left) {
 tl::expected<void, ErrorCode> Client::RegisterLocalMemory(
     void* addr, size_t length, const std::string& location,
     bool remote_accessible, bool update_metadata) {
+    std::lock_guard<std::recursive_mutex> lock(external_store_mutex_);
     auto check_result = CheckRegisterMemoryParams(addr, length, protocol_);
     if (!check_result) {
         return tl::unexpected(check_result.error());
@@ -4080,11 +4101,25 @@ tl::expected<void, ErrorCode> Client::RegisterLocalMemory(
             addr, length, location, remote_accessible, update_metadata) != 0) {
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
+    if (external_store_backend_) {
+        auto registered = RegisterExternalMemory(addr, length);
+        if (!registered) {
+            transfer_engine_->unregisterLocalMemory(addr, update_metadata);
+            return registered;
+        }
+    }
     return {};
 }
 
 tl::expected<void, ErrorCode> Client::unregisterLocalMemory(
     void* addr, bool update_metadata) {
+    std::lock_guard<std::recursive_mutex> lock(external_store_mutex_);
+    if (external_store_backend_ && external_regions_.count(addr)) {
+        auto result = external_store_backend_->UnregisterRegions(
+            {external_regions_.at(addr)});
+        if (!result) return result;
+        external_regions_.erase(addr);
+    }
     if (this->transfer_engine_->unregisterLocalMemory(addr, update_metadata) !=
         0) {
         return tl::unexpected(ErrorCode::INVALID_PARAMS);

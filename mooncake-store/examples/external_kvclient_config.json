@@ -1,0 +1,7 @@
+{
+  "backend": "kvclient",
+  "sdk_config_path": "/path/to/kvclient-sdk.json",
+  "wait_timeout_ms": 30000,
+  "_usage": "Set MOONCAKE_EXTERNAL_STORE_CONFIG to this file. Only direct, pre-registered buffers are supported. put/put_batch/put_parts and stage_nonlocal are unsupported; use FileStorage for internal staging.",
+  "_prototype": "One Slice per key; original key is not parsed; offset=0. SDK config should set maxErrorCount=1. An uncertain Store failure stops the SDK; shutdown-barrier failure is fail-stop. Read fallback is not implemented."
+}

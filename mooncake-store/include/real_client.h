@@ -119,6 +119,10 @@ class RealClient : public PyClient {
             const ReplicateConfig &config = ReplicateConfig{});
 
     int register_buffer(void *buffer, size_t size);
+    int register_external_buffer(void *buffer, size_t size);
+    bool external_store_enabled() const {
+        return client_ && client_->HasExternalStoreBackend();
+    }
 
     int unregister_buffer(void *buffer);
 
