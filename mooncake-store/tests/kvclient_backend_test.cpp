@@ -90,14 +90,14 @@ int main() {
         return sdk->Shutdown().ok();
     };
     alignas(512) char data[2048]{};
-    KVClientBackend backend(sdk, "tenant-a", barrier);
+    KVClientBackend backend(sdk, barrier);
     std::vector<std::shared_ptr<const StorageBuffer>> regions;
     Require(bool(backend.RegisterRegions({{data, sizeof(data), "host", -1, {}}},
                                          regions)));
-    auto pending =
-        backend.BatchPut({"A", "B", "C"}, {{{data + 512, 512}},
-                                           {{data, 512}, {data + 512, 512}},
-                                           {{data + 1024, 512}}});
+    auto pending = backend.BatchPut("tenant-a", {"A", "B", "C"},
+                                    {{{data + 512, 512}},
+                                     {{data, 512}, {data + 512, 512}},
+                                     {{data + 1024, 512}}});
     Require(bool(pending));
     Require(sdk->stores == 1 && sdk->entries.size() == 2);
     Require(sdk->entries[0].offset == 0 && sdk->entries[0].buffer.handle == 42);
@@ -109,32 +109,32 @@ int main() {
     auto result = backend.Wait(*pending, 100);
     Require(result.size() == 3 && result[0] && !result[1] && result[2]);
     const auto stored_key = sdk->entries[0].key;
-    pending = backend.Remove("A");
+    pending = backend.Remove("tenant-a", "A");
     Require(bool(pending) && sdk->removed[0] == stored_key);
     Require(bool(backend.Wait(*pending, 100)[0]));
     Require(sdk->registers == 1);  // No registration in Put.
 
-    pending = backend.Put("outside", {{data + 1900, 512}});
+    pending = backend.Put("tenant-a", "outside", {{data + 1900, 512}});
     Require(bool(pending) && !backend.Wait(*pending, 100)[0]);
     Require(sdk->stores ==
             1);  // Reject an out-of-bounds range before SDK submission.
     Require(bool(backend.UnregisterRegions(regions)));
-    pending = backend.Put("unregistered", {{data, 512}});
+    pending = backend.Put("tenant-a", "unregistered", {{data, 512}});
     Require(bool(pending) && !backend.Wait(*pending, 100)[0]);
 
     Require(bool(backend.RegisterRegions({{data, sizeof(data), "host", -1, {}}},
                                          regions)));
     sdk->reject = true;
-    pending = backend.Put("busy", {{data, 512}});
+    pending = backend.Put("tenant-a", "busy", {{data, 512}});
     Require(bool(pending) && !backend.Wait(*pending, 100)[0]);
     Require(sdk->waits ==
             2);  // Submission failure did not invent a task to wait on.
     sdk->reject = false;
     sdk->timeout = true;
-    pending = backend.Put("timeout", {{data, 512}});
+    pending = backend.Put("tenant-a", "timeout", {{data, 512}});
     Require(bool(pending) && !backend.Wait(*pending, 1)[0]);
     Require(barriers == 1 && sdk->stops == 1);
-    Require(!backend.Put("after-stop", {{data, 512}}));
+    Require(!backend.Put("tenant-a", "after-stop", {{data, 512}}));
     Require(bool(backend.UnregisterRegions(regions)));
     std::cout << "KVClient backend tests passed\n";
 }

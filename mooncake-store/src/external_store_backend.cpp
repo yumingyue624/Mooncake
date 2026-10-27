@@ -12,8 +12,7 @@
 namespace mooncake {
 
 tl::expected<std::shared_ptr<ExternalStoreBackend>, ErrorCode>
-CreateExternalStoreBackend(const std::string& path, const std::string& tenant,
-                           uint64_t& wait_timeout_ms) {
+CreateExternalStoreBackend(const std::string& path, uint64_t& wait_timeout_ms) {
     if (path.empty()) return std::shared_ptr<ExternalStoreBackend>{};
     Json::Value config;
     Json::CharReaderBuilder reader;
@@ -43,7 +42,7 @@ CreateExternalStoreBackend(const std::string& path, const std::string& tenant,
         // SDK rather than relying on the asynchronous maxErrorCount drain.
         return std::shared_ptr<ExternalStoreBackend>(
             std::make_shared<KVClientBackend>(
-                sdk, tenant, [sdk] { return sdk->Shutdown().ok(); }));
+                sdk, [sdk] { return sdk->Shutdown().ok(); }));
     }
 #endif
     LOG(ERROR) << "External store backend unavailable: " << name;

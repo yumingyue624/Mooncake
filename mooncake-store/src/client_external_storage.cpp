@@ -25,8 +25,7 @@ void Client::SetExternalStoreBackend(
 tl::expected<void, ErrorCode> Client::InitExternalStoreBackend() {
     const char* path = std::getenv("MOONCAKE_EXTERNAL_STORE_CONFIG");
     if (!path || !*path) return {};
-    auto backend = CreateExternalStoreBackend(path, tenant_id(),
-                                              external_wait_timeout_ms_);
+    auto backend = CreateExternalStoreBackend(path, external_wait_timeout_ms_);
     if (!backend) return tl::unexpected(backend.error());
     external_store_backend_ = std::move(*backend);
     return {};

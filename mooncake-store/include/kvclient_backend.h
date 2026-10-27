@@ -17,17 +17,18 @@ namespace mooncake {
 class KVClientBackend final : public ExternalStoreBackend {
    public:
     using Quiesce = std::function<bool()>;
-    KVClientBackend(std::shared_ptr<kv::KvClient> sdk, std::string tenant,
-                    Quiesce quiesce);
+    KVClientBackend(std::shared_ptr<kv::KvClient> sdk, Quiesce quiesce);
     ~KVClientBackend() override;
-    tl::expected<void*, ErrorCode> Put(const ObjectKey&,
+    tl::expected<void*, ErrorCode> Put(const std::string& tenant,
+                                       const ObjectKey&,
                                        const std::vector<Slice>&) override;
     tl::expected<void*, ErrorCode> BatchPut(
-        const std::vector<ObjectKey>&,
+        const std::string& tenant, const std::vector<ObjectKey>&,
         const std::vector<std::vector<Slice>>&) override;
-    tl::expected<void*, ErrorCode> Remove(const ObjectKey&) override;
+    tl::expected<void*, ErrorCode> Remove(const std::string& tenant,
+                                          const ObjectKey&) override;
     tl::expected<void*, ErrorCode> BatchRemove(
-        const std::vector<ObjectKey>&) override;
+        const std::string& tenant, const std::vector<ObjectKey>&) override;
     std::vector<tl::expected<void, ErrorCode>> Wait(void*, uint64_t) override;
 
    private:

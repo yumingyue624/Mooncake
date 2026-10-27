@@ -65,7 +65,6 @@ struct KVClientBackend::Impl {
     };
 
     std::shared_ptr<kv::KvClient> sdk;
-    std::string tenant;
     Quiesce quiesce;
     std::mutex mutex;
     bool disabled = false;
@@ -75,7 +74,8 @@ struct KVClientBackend::Impl {
     // globally collision-free, persistent mapping for arbitrary string keys.
     std::map<kv::CacheKey, std::string> key_owners;
 
-    tl::expected<kv::CacheKey, ErrorCode> Key(const std::string& key) {
+    tl::expected<kv::CacheKey, ErrorCode> Key(const std::string& tenant,
+                                              const std::string& key) {
         if (key.empty()) return tl::unexpected(ErrorCode::INVALID_KEY);
         const auto identity =
             std::to_string(tenant.size()) + ":" + tenant + key;
@@ -108,7 +108,7 @@ struct KVClientBackend::Impl {
     }
 
     tl::expected<void*, ErrorCode> Submit(
-        const std::vector<ObjectKey>& keys,
+        const std::string& tenant, const std::vector<ObjectKey>& keys,
         const std::vector<std::vector<Slice>>* slices, bool batch) {
         std::lock_guard<std::mutex> lock(mutex);
         if (disabled)
@@ -127,7 +127,7 @@ struct KVClientBackend::Impl {
         task->indices.reserve(keys.size());
         task->regions.reserve(keys.size());
         for (size_t i = 0; i < keys.size(); ++i) {
-            auto key = Key(keys[i]);
+            auto key = Key(tenant, keys[i]);
             if (!key) {
                 task->results[i] = tl::unexpected(key.error());
                 continue;
@@ -203,12 +203,11 @@ struct KVClientBackend::Impl {
 };
 
 KVClientBackend::KVClientBackend(std::shared_ptr<kv::KvClient> sdk,
-                                 std::string tenant, Quiesce quiesce)
+                                 Quiesce quiesce)
     : impl_(std::make_unique<Impl>()) {
     if (!sdk || !quiesce)
         throw std::invalid_argument("SDK and quiesce required");
     impl_->sdk = std::move(sdk);
-    impl_->tenant = std::move(tenant);
     impl_->quiesce = std::move(quiesce);
 }
 
@@ -218,24 +217,26 @@ KVClientBackend::~KVClientBackend() {
 }
 
 tl::expected<void*, ErrorCode> KVClientBackend::Put(
-    const ObjectKey& key, const std::vector<Slice>& slices) {
+    const std::string& tenant, const ObjectKey& key,
+    const std::vector<Slice>& slices) {
     const std::vector<std::vector<Slice>> batch{slices};
-    return impl_->Submit({key}, &batch, false);
+    return impl_->Submit(tenant, {key}, &batch, false);
 }
 
 tl::expected<void*, ErrorCode> KVClientBackend::BatchPut(
-    const std::vector<ObjectKey>& keys,
+    const std::string& tenant, const std::vector<ObjectKey>& keys,
     const std::vector<std::vector<Slice>>& slices) {
-    return impl_->Submit(keys, &slices, true);
+    return impl_->Submit(tenant, keys, &slices, true);
 }
 
-tl::expected<void*, ErrorCode> KVClientBackend::Remove(const ObjectKey& key) {
-    return impl_->Submit({key}, nullptr, false);
+tl::expected<void*, ErrorCode> KVClientBackend::Remove(
+    const std::string& tenant, const ObjectKey& key) {
+    return impl_->Submit(tenant, {key}, nullptr, false);
 }
 
 tl::expected<void*, ErrorCode> KVClientBackend::BatchRemove(
-    const std::vector<ObjectKey>& keys) {
-    return impl_->Submit(keys, nullptr, true);
+    const std::string& tenant, const std::vector<ObjectKey>& keys) {
+    return impl_->Submit(tenant, keys, nullptr, true);
 }
 
 std::vector<tl::expected<void, ErrorCode>> KVClientBackend::Wait(

@@ -18,20 +18,26 @@ class FakeBackend final : public ExternalStoreBackend {
     Results results;
     bool reject = false;
     int token = 1;
-    tl::expected<void*, ErrorCode> Put(const ObjectKey&,
+    tl::expected<void*, ErrorCode> Put(const std::string& tenant,
+                                       const ObjectKey&,
                                        const std::vector<Slice>&) override {
+        Require(tenant == "tenant-a");
         return Submit();
     }
     tl::expected<void*, ErrorCode> BatchPut(
-        const std::vector<ObjectKey>&,
+        const std::string& tenant, const std::vector<ObjectKey>&,
         const std::vector<std::vector<Slice>>&) override {
+        Require(tenant == "tenant-a");
         return Submit();
     }
-    tl::expected<void*, ErrorCode> Remove(const ObjectKey&) override {
+    tl::expected<void*, ErrorCode> Remove(const std::string& tenant,
+                                          const ObjectKey&) override {
+        Require(tenant == "tenant-a");
         return Submit();
     }
     tl::expected<void*, ErrorCode> BatchRemove(
-        const std::vector<ObjectKey>&) override {
+        const std::string& tenant, const std::vector<ObjectKey>&) override {
+        Require(tenant == "tenant-a");
         return Submit();
     }
     Results Wait(void* task, uint64_t) override {
@@ -53,7 +59,7 @@ static Results RunWrite(ExternalStoreBackend& backend,
                         const std::vector<std::vector<Slice>>& slices,
                         uint64_t timeout, bool single,
                         const std::function<Results()>& native) {
-    external_detail::PendingExternal pending(&backend, timeout);
+    external_detail::PendingExternal pending(&backend, timeout, "tenant-a");
     if (single)
         pending.Put(keys[0], slices[0]);
     else
@@ -64,7 +70,7 @@ static Results RunWrite(ExternalStoreBackend& backend,
 static Results RunRemove(ExternalStoreBackend& backend,
                          const std::vector<ObjectKey>& keys, uint64_t timeout,
                          bool single, const std::function<Results()>& native) {
-    external_detail::PendingExternal pending(&backend, timeout);
+    external_detail::PendingExternal pending(&backend, timeout, "tenant-a");
     if (single)
         pending.Remove(keys[0]);
     else
@@ -124,7 +130,7 @@ int main() {
     for (const auto& entry : result) Require(!entry);
     backend.results = {{}};
     {
-        external_detail::PendingExternal pending(&backend, 1);
+        external_detail::PendingExternal pending(&backend, 1, "tenant-a");
         pending.Put("single", {{&data, sizeof(data)}});
         Require(bool(pending.Finish(tl::unexpected(ErrorCode::WRITE_FAIL))));
     }
