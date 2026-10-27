@@ -1,4 +1,5 @@
 #include "client_service.h"
+#include "external_store_backend.h"
 
 #include <boost/algorithm/string.hpp>
 #include <glog/logging.h>
@@ -15,6 +16,7 @@
 #include <cstdint>
 #include <cstring>
 #include <cstdlib>
+#include <exception>
 #include <iomanip>
 #include <limits>
 #ifdef USE_NOF
@@ -26,6 +28,8 @@
 #include <sched.h>
 #include <thread>
 #include <set>
+#include <stdexcept>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 #include <ylt/struct_json/json_reader.h>
@@ -54,6 +58,15 @@
 
 namespace mooncake {
 
+void Client::SetExternalStoreBackend(
+    std::shared_ptr<ExternalStoreBackend> backend, uint64_t wait_timeout_ms) {
+    if (!wait_timeout_ms) {
+        throw std::invalid_argument("External wait timeout must be positive");
+    }
+    external_store_backend_ = std::move(backend);
+    external_wait_timeout_ms_ = wait_timeout_ms;
+}
+
 std::optional<size_t> GetTransportRegistrationLimit(
     const std::string& protocol) {
     if (protocol == "efa" || protocol == "cxi") {
@@ -66,6 +79,32 @@ std::optional<size_t> GetTransportRegistrationLimit(
 }
 
 namespace {
+
+void CheckExternalResults(std::vector<tl::expected<void, ErrorCode>>& results,
+                          size_t count) {
+    if (results.size() != count) {
+        results = std::vector<tl::expected<void, ErrorCode>>(
+            count, tl::unexpected(ErrorCode::INTERNAL_ERROR));
+    }
+    for (size_t i = 0; i < results.size(); ++i) {
+        if (!results[i])
+            LOG(WARNING) << "External operation failed at index " << i << ": "
+                         << results[i].error();
+    }
+}
+
+std::vector<tl::expected<void, ErrorCode>> MergeExternalPutResults(
+    std::vector<tl::expected<void, ErrorCode>> native,
+    const std::vector<tl::expected<void, ErrorCode>>& external) {
+    if (native.size() != external.size()) {
+        native = std::vector<tl::expected<void, ErrorCode>>(
+            external.size(), tl::unexpected(ErrorCode::INTERNAL_ERROR));
+    }
+    for (size_t i = 0; i < external.size(); ++i) {
+        if (external[i]) native[i] = {};
+    }
+    return native;
+}
 
 constexpr size_t kObjectChecksumD2HChunkSize = 8 * 1024 * 1024;
 constexpr auto kInitialLeaderReadyTimeout = std::chrono::seconds(30);
@@ -479,6 +518,7 @@ Client::Client(const std::string& local_hostname,
 }
 
 Client::~Client() {
+    external_store_backend_.reset();
     task_poll_running_ = false;
     if (task_poll_thread_.joinable()) {
         task_poll_thread_.join();
@@ -1136,6 +1176,12 @@ std::optional<std::shared_ptr<Client>> Client::Create(
 
     // this only performs RPC calls
     if (protocol == "rpc_only") {
+        const char* external_config =
+            std::getenv("MOONCAKE_EXTERNAL_STORE_CONFIG");
+        if (external_config && *external_config) {
+            LOG(ERROR) << "External store requires a transfer-capable Client";
+            return std::nullopt;
+        }
         LOG(INFO) << "Use rpc only. Skip initializing transfer engine.";
         return client;
     }
@@ -1162,6 +1208,13 @@ std::optional<std::shared_ptr<Client>> Client::Create(
         LOG(ERROR) << "Failed to initialize local hot cache";
     }
 
+    const char* external_config = std::getenv("MOONCAKE_EXTERNAL_STORE_CONFIG");
+    if (external_config && *external_config) {
+        auto backend = CreateExternalStoreBackend(
+            external_config, client->external_wait_timeout_ms_);
+        if (!backend) return std::nullopt;
+        client->external_store_backend_ = std::move(*backend);
+    }
     return client;
 }
 
@@ -1985,6 +2038,35 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
     }
 
     // Start put operation
+    std::vector<tl::expected<void, ErrorCode>> external_results;
+    auto wait_external = [&](void* task) noexcept {
+        try {
+            external_results =
+                external_store_backend_->Wait(task, external_wait_timeout_ms_);
+        } catch (...) {
+            std::terminate();
+        }
+    };
+    // Drain an outstanding task even if the native path throws.
+    std::unique_ptr<void, decltype(wait_external)> external_task(nullptr,
+                                                                 wait_external);
+    if (external_store_backend_) {
+        auto submitted = external_store_backend_->Put(tenant_id(), key, slices);
+        if (submitted && *submitted) {
+            external_task.reset(*submitted);
+        } else {
+            external_results.assign(
+                1, tl::unexpected(submitted ? ErrorCode::INTERNAL_ERROR
+                                            : submitted.error()));
+        }
+    }
+    auto finish_external = [&](tl::expected<void, ErrorCode> native_result) {
+        if (!external_store_backend_) return native_result;
+        external_task.reset();
+        CheckExternalResults(external_results, 1);
+        return MergeExternalPutResults({std::move(native_result)},
+                                       external_results)[0];
+    };
     auto start_result = master_client_.PutStart(key, slice_lengths, client_cfg);
     if (!start_result &&
         start_result.error() == ErrorCode::OBJECT_ALREADY_EXISTS &&
@@ -1995,7 +2077,7 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
         ErrorCode err = start_result.error();
         if (err == ErrorCode::OBJECT_ALREADY_EXISTS) {
             VLOG(1) << "object_already_exists key=" << key;
-            return {};
+            return finish_external(tl::expected<void, ErrorCode>{});
         }
         if (err == ErrorCode::NO_AVAILABLE_HANDLE) {
             LOG(WARNING) << "Failed to start put operation for key=" << key
@@ -2004,7 +2086,7 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
             LOG(ERROR) << "Failed to start put operation for key=" << key
                        << ": " << toString(err);
         }
-        return tl::unexpected(err);
+        return finish_external(tl::unexpected(err));
     }
 
     ReplicaTransferSummary transfer_summary;
@@ -2094,7 +2176,7 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
         if (!end_result) {
             ErrorCode err = end_result.error();
             LOG(ERROR) << "Failed to end put operation: " << err;
-            return tl::unexpected(err);
+            return finish_external(tl::unexpected(err));
         }
     }
 
@@ -2103,15 +2185,15 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
             master_client_.PutRevoke(key, *finalize_decision.revoke_type);
         if (!revoke_result) {
             LOG(ERROR) << "Failed to revoke put operation";
-            return tl::unexpected(revoke_result.error());
+            return finish_external(tl::unexpected(revoke_result.error()));
         }
     }
 
     if (!finalize_decision.success) {
-        return tl::unexpected(finalize_decision.error);
+        return finish_external(tl::unexpected(finalize_decision.error));
     }
 
-    return {};
+    return finish_external(tl::expected<void, ErrorCode>{});
 }
 
 namespace {
@@ -2202,6 +2284,35 @@ tl::expected<void, ErrorCode> Client::Upsert(const ObjectKey& key,
     }
 
     // Start upsert operation
+    std::vector<tl::expected<void, ErrorCode>> external_results;
+    auto wait_external = [&](void* task) noexcept {
+        try {
+            external_results =
+                external_store_backend_->Wait(task, external_wait_timeout_ms_);
+        } catch (...) {
+            std::terminate();
+        }
+    };
+    // Drain an outstanding task even if the native path throws.
+    std::unique_ptr<void, decltype(wait_external)> external_task(nullptr,
+                                                                 wait_external);
+    if (external_store_backend_) {
+        auto submitted = external_store_backend_->Put(tenant_id(), key, slices);
+        if (submitted && *submitted) {
+            external_task.reset(*submitted);
+        } else {
+            external_results.assign(
+                1, tl::unexpected(submitted ? ErrorCode::INTERNAL_ERROR
+                                            : submitted.error()));
+        }
+    }
+    auto finish_external = [&](tl::expected<void, ErrorCode> native_result) {
+        if (!external_store_backend_) return native_result;
+        external_task.reset();
+        CheckExternalResults(external_results, 1);
+        return MergeExternalPutResults({std::move(native_result)},
+                                       external_results)[0];
+    };
     auto start_result =
         master_client_.UpsertStart(key, slice_lengths, client_cfg);
     if (!start_result) {
@@ -2213,7 +2324,7 @@ tl::expected<void, ErrorCode> Client::Upsert(const ObjectKey& key,
             LOG(ERROR) << "Failed to start upsert operation for key=" << key
                        << ": " << toString(err);
         }
-        return tl::unexpected(err);
+        return finish_external(tl::unexpected(err));
     }
 
     ReplicaTransferSummary transfer_summary;
@@ -2299,7 +2410,7 @@ tl::expected<void, ErrorCode> Client::Upsert(const ObjectKey& key,
         if (!end_result) {
             ErrorCode err = end_result.error();
             LOG(ERROR) << "Failed to end upsert operation: " << err;
-            return tl::unexpected(err);
+            return finish_external(tl::unexpected(err));
         }
     }
     if (finalize_decision.revoke_type.has_value()) {
@@ -2307,11 +2418,11 @@ tl::expected<void, ErrorCode> Client::Upsert(const ObjectKey& key,
             master_client_.UpsertRevoke(key, *finalize_decision.revoke_type);
         if (!revoke_result) {
             LOG(ERROR) << "Failed to revoke upsert operation";
-            return tl::unexpected(revoke_result.error());
+            return finish_external(tl::unexpected(revoke_result.error()));
         }
     }
     if (!finalize_decision.success) {
-        return tl::unexpected(finalize_decision.error);
+        return finish_external(tl::unexpected(finalize_decision.error));
     }
 
     // Success-side invalidation: a concurrent read between the pre-upsert
@@ -2322,7 +2433,7 @@ tl::expected<void, ErrorCode> Client::Upsert(const ObjectKey& key,
         hot_cache_->RemoveHotKey(key);
     }
 
-    return {};
+    return finish_external(tl::expected<void, ErrorCode>{});
 }
 
 // TODO: `client.cpp` is too long, consider split it into multiple files
@@ -3581,6 +3692,12 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPut(
     const std::vector<ObjectKey>& keys,
     std::vector<std::vector<Slice>>& batched_slices,
     const ReplicateConfig& config, const WriteBufferStager& stager) {
+    if (keys.size() != batched_slices.size() ||
+        (external_store_backend_ && stager)) {
+        return std::vector<tl::expected<void, ErrorCode>>(
+            keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
+    }
+
     ReplicateConfig client_cfg = AttachHostId(config);
     if (protocol_ == "cxl") {
         client_cfg.preferred_segment = local_hostname_;
@@ -3592,9 +3709,43 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPut(
             return std::vector<tl::expected<void, ErrorCode>>(
                 keys.size(), tl::unexpected(*err));
         }
+    }
+    std::vector<tl::expected<void, ErrorCode>> external_results;
+    auto wait_external = [&](void* task) noexcept {
+        try {
+            external_results =
+                external_store_backend_->Wait(task, external_wait_timeout_ms_);
+        } catch (...) {
+            std::terminate();
+        }
+    };
+    // Drain an outstanding task even if the native path throws.
+    std::unique_ptr<void, decltype(wait_external)> external_task(nullptr,
+                                                                 wait_external);
+    if (external_store_backend_) {
+        auto submitted = external_store_backend_->BatchPut(tenant_id(), keys,
+                                                           batched_slices);
+        if (submitted && *submitted) {
+            external_task.reset(*submitted);
+        } else {
+            external_results.assign(
+                keys.size(),
+                tl::unexpected(submitted ? ErrorCode::INTERNAL_ERROR
+                                         : submitted.error()));
+        }
+    }
+    auto finish_external =
+        [&](std::vector<tl::expected<void, ErrorCode>> native_result) {
+            if (!external_store_backend_) return native_result;
+            external_task.reset();
+            CheckExternalResults(external_results, keys.size());
+            return MergeExternalPutResults(std::move(native_result),
+                                           external_results);
+        };
+    if (client_cfg.prefer_alloc_in_same_node) {
         StartBatchPut(ops, client_cfg);
         StageWriteBuffersForRemoteReplicas(ops, stager);
-        return BatchWriteWhenPreferSameNode(ops, false);
+        return finish_external(BatchWriteWhenPreferSameNode(ops, false));
     }
     StartBatchPut(ops, client_cfg);
     StageWriteBuffersForRemoteReplicas(ops, stager);
@@ -3611,7 +3762,7 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPut(
     }
 
     FinalizeBatchPut(ops);
-    return CollectResults(ops);
+    return finish_external(CollectResults(ops));
 }
 
 // Defined after PutOperation: std::vector<PutOperation> must be instantiated
@@ -3627,6 +3778,12 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchUpsert(
     const std::vector<ObjectKey>& keys,
     std::vector<std::vector<Slice>>& batched_slices,
     const ReplicateConfig& config, const WriteBufferStager& stager) {
+    if (keys.size() != batched_slices.size() ||
+        (external_store_backend_ && stager)) {
+        return std::vector<tl::expected<void, ErrorCode>>(
+            keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
+    }
+
     ReplicateConfig client_cfg = AttachHostId(config);
     if (protocol_ == "cxl") {
         client_cfg.preferred_segment = local_hostname_;
@@ -3638,9 +3795,43 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchUpsert(
             return std::vector<tl::expected<void, ErrorCode>>(
                 keys.size(), tl::unexpected(*err));
         }
+    }
+    std::vector<tl::expected<void, ErrorCode>> external_results;
+    auto wait_external = [&](void* task) noexcept {
+        try {
+            external_results =
+                external_store_backend_->Wait(task, external_wait_timeout_ms_);
+        } catch (...) {
+            std::terminate();
+        }
+    };
+    // Drain an outstanding task even if the native path throws.
+    std::unique_ptr<void, decltype(wait_external)> external_task(nullptr,
+                                                                 wait_external);
+    if (external_store_backend_) {
+        auto submitted = external_store_backend_->BatchPut(tenant_id(), keys,
+                                                           batched_slices);
+        if (submitted && *submitted) {
+            external_task.reset(*submitted);
+        } else {
+            external_results.assign(
+                keys.size(),
+                tl::unexpected(submitted ? ErrorCode::INTERNAL_ERROR
+                                         : submitted.error()));
+        }
+    }
+    auto finish_external =
+        [&](std::vector<tl::expected<void, ErrorCode>> native_result) {
+            if (!external_store_backend_) return native_result;
+            external_task.reset();
+            CheckExternalResults(external_results, keys.size());
+            return MergeExternalPutResults(std::move(native_result),
+                                           external_results);
+        };
+    if (client_cfg.prefer_alloc_in_same_node) {
         StartBatchUpsert(ops, client_cfg);
         StageWriteBuffersForRemoteReplicas(ops, stager);
-        return BatchWriteWhenPreferSameNode(ops, true);
+        return finish_external(BatchWriteWhenPreferSameNode(ops, true));
     }
 
     StartBatchUpsert(ops, client_cfg);
@@ -3657,13 +3848,18 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchUpsert(
     }
 
     FinalizeBatchUpsert(ops);
-    return CollectResults(ops);
+    return finish_external(CollectResults(ops));
 }
 
 std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
 Client::StartBatchPutForSizes(const std::vector<std::string>& keys,
                               const std::vector<uint64_t>& object_sizes,
                               const ReplicateConfig& config) {
+    if (external_store_backend_) {
+        return std::vector<
+            tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>(
+            keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
+    }
     std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
         results(keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
     if (keys.size() != object_sizes.size()) {
@@ -3709,22 +3905,53 @@ tl::expected<void, ErrorCode> Client::Remove(const ObjectKey& key, bool force) {
         hot_cache_->BumpKeyGeneration(key);
     }
 
+    std::vector<tl::expected<void, ErrorCode>> external_results;
+    auto wait_external = [&](void* task) noexcept {
+        try {
+            external_results =
+                external_store_backend_->Wait(task, external_wait_timeout_ms_);
+        } catch (...) {
+            std::terminate();
+        }
+    };
+    // Drain an outstanding task even if the native path throws.
+    std::unique_ptr<void, decltype(wait_external)> external_task(nullptr,
+                                                                 wait_external);
+    if (external_store_backend_) {
+        auto submitted = external_store_backend_->Remove(tenant_id(), key);
+        if (submitted && *submitted) {
+            external_task.reset(*submitted);
+        } else {
+            external_results.assign(
+                1, tl::unexpected(submitted ? ErrorCode::INTERNAL_ERROR
+                                            : submitted.error()));
+        }
+    }
+    auto finish_external = [&](tl::expected<void, ErrorCode> native_result) {
+        if (!external_store_backend_) return native_result;
+        external_task.reset();
+        CheckExternalResults(external_results, 1);
+        return native_result;
+    };
     auto result = master_client_.Remove(key, force);
     // if (storage_backend_) {
     //     storage_backend_->RemoveFile(key);
     // }
     if (!result) {
-        return tl::unexpected(result.error());
+        return finish_external(tl::unexpected(result.error()));
     }
     if (hot_cache_) {
         hot_cache_->RemoveHotKey(key);
     }
 
-    return {};
+    return finish_external(tl::expected<void, ErrorCode>{});
 }
 
 tl::expected<long, ErrorCode> Client::RemoveByRegex(const ObjectKey& str,
                                                     bool force) {
+    if (external_store_backend_) {
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
     if (hot_cache_) {
         hot_cache_->BumpCacheEpoch();
     }
@@ -3744,6 +3971,9 @@ tl::expected<long, ErrorCode> Client::RemoveByRegex(const ObjectKey& str,
 }
 
 tl::expected<long, ErrorCode> Client::RemoveAll(bool force) {
+    if (external_store_backend_) {
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
     if (hot_cache_) {
         hot_cache_->BumpCacheEpoch();
     }
@@ -3766,6 +3996,37 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchRemove(
         hot_cache_->BumpKeyGenerations(keys);
     }
 
+    std::vector<tl::expected<void, ErrorCode>> external_results;
+    auto wait_external = [&](void* task) noexcept {
+        try {
+            external_results =
+                external_store_backend_->Wait(task, external_wait_timeout_ms_);
+        } catch (...) {
+            std::terminate();
+        }
+    };
+    // Drain an outstanding task even if the native path throws.
+    std::unique_ptr<void, decltype(wait_external)> external_task(nullptr,
+                                                                 wait_external);
+    if (external_store_backend_) {
+        auto submitted =
+            external_store_backend_->BatchRemove(tenant_id(), keys);
+        if (submitted && *submitted) {
+            external_task.reset(*submitted);
+        } else {
+            external_results.assign(
+                keys.size(),
+                tl::unexpected(submitted ? ErrorCode::INTERNAL_ERROR
+                                         : submitted.error()));
+        }
+    }
+    auto finish_external =
+        [&](std::vector<tl::expected<void, ErrorCode>> native_result) {
+            if (!external_store_backend_) return native_result;
+            external_task.reset();
+            CheckExternalResults(external_results, keys.size());
+            return native_result;
+        };
     auto results = master_client_.BatchRemove(keys, force);
 
     if (hot_cache_) {
@@ -3781,7 +4042,7 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchRemove(
         }
     }
 
-    return results;
+    return finish_external(results);
 }
 
 tl::expected<void, ErrorCode> Client::EvictDiskReplica(

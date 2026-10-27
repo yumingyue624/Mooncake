@@ -30,6 +30,8 @@
 
 namespace mooncake {
 
+class ExternalStoreBackend;
+
 class PutOperation;
 class DistributedStorageBackend;
 
@@ -84,6 +86,13 @@ class Client {
 
     const UUID& getClientId() const { return client_id_; }
     const std::string& tenant_id() const { return master_client_.tenant_id(); }
+
+    // Configure before registering buffers or serving requests.
+    void SetExternalStoreBackend(std::shared_ptr<ExternalStoreBackend> backend,
+                                 uint64_t wait_timeout_ms = 30000);
+    bool HasExternalStoreBackend() const {
+        return bool(external_store_backend_);
+    }
 
     /**
      * @brief Creates and initializes a new Client instance
@@ -872,6 +881,8 @@ class Client {
                                     uint64_t quota_bytes = 0);
 
    private:
+    std::shared_ptr<ExternalStoreBackend> external_store_backend_;
+    uint64_t external_wait_timeout_ms_ = 30000;
     /**
      * @brief Internal helper functions for initialization and data transfer
      */

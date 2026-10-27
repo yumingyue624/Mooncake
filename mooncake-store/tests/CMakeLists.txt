@@ -37,6 +37,12 @@ function(add_ha_test name)
   add_test(NAME ${name} COMMAND ${name})
 endfunction()
 
+if(MOONCAKE_WITH_KVCLIENT)
+  add_store_test(kvclient_backend_test kvclient_backend_test.cpp)
+  target_include_directories(kvclient_backend_test
+                             PRIVATE ${KVCLIENT_INCLUDE_DIR})
+endif()
+
 add_store_test(buffer_allocator_test buffer_allocator_test.cpp)
 add_store_test(weight_management_contract_test
                weight_management_contract_test.cpp)

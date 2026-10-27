@@ -20,6 +20,7 @@
 
 #include "allocator.h"
 #include "client_service.h"
+#include "external_store_backend.h"
 #include "real_client.h"
 #include "types.h"
 #include "common/client_buffer_allocation.h"
@@ -105,6 +106,22 @@ TEST(ObjectChecksumTest, BatchPutStopsAfterChecksumPrecomputeFailure) {
     ASSERT_EQ(results.size(), 1);
     ASSERT_FALSE(results[0].has_value());
     EXPECT_EQ(results[0].error(), ErrorCode::INVALID_PARAMS);
+}
+
+TEST(ClientWriteValidationTest, RejectsMismatchedBatchSizesBeforeNativeWork) {
+    ObjectChecksumClient client;
+    const std::vector<ObjectKey> keys{"a", "b"};
+    std::vector<std::vector<Slice>> slices(1);
+    auto put = client.BatchPut(keys, slices, ReplicateConfig{});
+    auto upsert = client.BatchUpsert(keys, slices, ReplicateConfig{});
+    ASSERT_EQ(put.size(), keys.size());
+    ASSERT_EQ(upsert.size(), keys.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        ASSERT_FALSE(put[i]);
+        ASSERT_FALSE(upsert[i]);
+        EXPECT_EQ(put[i].error(), ErrorCode::INVALID_PARAMS);
+        EXPECT_EQ(upsert[i].error(), ErrorCode::INVALID_PARAMS);
+    }
 }
 
 class ClientIdCaptureSink : public google::LogSink {
@@ -348,6 +365,99 @@ std::string ClientIntegrationTest::master_address_;
 std::string ClientIntegrationTest::metadata_url_;
 UUID ClientIntegrationTest::test_client_id_{0, 0};
 UUID ClientIntegrationTest::segment_provider_client_id_{0, 0};
+
+class FakeExternalBackend : public ExternalStoreBackend {
+   public:
+    std::vector<tl::expected<void, ErrorCode>> results;
+    size_t waits = 0;
+    tl::expected<void*, ErrorCode> Put(const std::string&, const ObjectKey&,
+                                       const std::vector<Slice>&) override {
+        return static_cast<void*>(this);
+    }
+    tl::expected<void*, ErrorCode> BatchPut(
+        const std::string&, const std::vector<ObjectKey>&,
+        const std::vector<std::vector<Slice>>&) override {
+        return static_cast<void*>(this);
+    }
+    tl::expected<void*, ErrorCode> Remove(const std::string&,
+                                          const ObjectKey&) override {
+        return static_cast<void*>(this);
+    }
+    tl::expected<void*, ErrorCode> BatchRemove(
+        const std::string&, const std::vector<ObjectKey>&) override {
+        return static_cast<void*>(this);
+    }
+    std::vector<tl::expected<void, ErrorCode>> Wait(void* task,
+                                                    uint64_t) override {
+        EXPECT_EQ(task, this);
+        ++waits;
+        return results;
+    }
+};
+
+TEST_F(ClientIntegrationTest, ExternalPutMergesResultsPerKey) {
+    auto backend = std::make_shared<FakeExternalBackend>();
+    backend->results = {{}, tl::unexpected(ErrorCode::TRANSFER_FAIL)};
+    void* buffer = client_buffer_allocator_->allocate(512);
+    memset(buffer, 0, 512);
+    std::vector<std::vector<Slice>> slices(2, {{buffer, 512}});
+    const std::vector<ObjectKey> keys{"external-merge-a", "external-merge-b"};
+    test_client_->SetExternalStoreBackend(backend);
+    ReplicateConfig config;
+    config.replica_num = 1;
+    auto native_success = test_client_->BatchPut(keys, slices, config);
+    config.replica_num = 0;
+    auto native_failure = test_client_->BatchPut(
+        {"external-only-a", "external-only-b"}, slices, config);
+    test_client_->SetExternalStoreBackend(nullptr);
+    for (const auto& key : keys) test_client_->Remove(key, true);
+    client_buffer_allocator_->deallocate(buffer, 512);
+
+    ASSERT_EQ(native_success.size(), 2);
+    EXPECT_TRUE(native_success[0]);
+    EXPECT_TRUE(native_success[1]);
+    ASSERT_EQ(native_failure.size(), 2);
+    EXPECT_TRUE(native_failure[0]);
+    EXPECT_FALSE(native_failure[1]);
+    EXPECT_EQ(backend->waits, 2);
+}
+
+TEST_F(ClientIntegrationTest, InvalidAndDuplicateKeysDoNotRejectWholeBatch) {
+    auto backend = std::make_shared<FakeExternalBackend>();
+    backend->results = {{}, tl::unexpected(ErrorCode::INVALID_KEY), {}};
+    void* buffer = client_buffer_allocator_->allocate(512);
+    memset(buffer, 0, 512);
+    const std::vector<ObjectKey> keys{"external-duplicate", "",
+                                      "external-duplicate"};
+    std::vector<std::vector<Slice>> slices{
+        {{buffer, 512}}, {}, {{buffer, 512}}};
+    ReplicateConfig config;
+    config.replica_num = 0;
+    test_client_->SetExternalStoreBackend(backend);
+    auto put = test_client_->BatchPut(keys, slices, config);
+    auto upsert = test_client_->BatchUpsert(keys, slices, config);
+    test_client_->SetExternalStoreBackend(nullptr);
+    client_buffer_allocator_->deallocate(buffer, 512);
+    ASSERT_EQ(put.size(), 3);
+    ASSERT_EQ(upsert.size(), 3);
+    EXPECT_TRUE(put[0]);
+    EXPECT_FALSE(put[1]);
+    EXPECT_TRUE(put[2]);
+    EXPECT_TRUE(upsert[0]);
+    EXPECT_FALSE(upsert[1]);
+    EXPECT_TRUE(upsert[2]);
+    EXPECT_EQ(backend->waits, 2);
+}
+
+TEST_F(ClientIntegrationTest, ExternalDeleteDoesNotOverrideNativeError) {
+    auto backend = std::make_shared<FakeExternalBackend>();
+    backend->results = {{}};
+    test_client_->SetExternalStoreBackend(backend);
+    auto result = test_client_->Remove("external-delete-missing", true);
+    test_client_->SetExternalStoreBackend(nullptr);
+    EXPECT_FALSE(result);
+    EXPECT_EQ(backend->waits, 1);
+}
 
 // Test basic Put/Get operations through the client
 TEST_F(ClientIntegrationTest, BasicPutGetOperations) {

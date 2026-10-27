@@ -104,6 +104,7 @@ set(MOONCAKE_STORE_CLIENT_SOURCES
     config/mmap_arena_config.cpp
     common/mmap_buffer.cpp
     client_service.cpp
+    external_store_backend.cpp
     client_metric.cpp
     master_client.cpp
     storage_backend.cpp
@@ -548,6 +549,27 @@ endif()
 # Sources used only by Store clients and the complete mooncake_store library.
 add_library(mooncake_store_client_objects OBJECT
             ${MOONCAKE_STORE_CLIENT_SOURCES})
+
+option(MOONCAKE_WITH_KVCLIENT "Build the optional external KVClient backend"
+       OFF)
+set(KVCLIENT_INCLUDE_DIR
+    ""
+    CACHE PATH "Directory containing kv_client.h")
+set(KVCLIENT_LIBRARY
+    ""
+    CACHE FILEPATH "Built KVClient SDK library")
+if(MOONCAKE_WITH_KVCLIENT)
+  if(NOT EXISTS "${KVCLIENT_INCLUDE_DIR}/kv_client.h" OR NOT EXISTS
+                                                         "${KVCLIENT_LIBRARY}")
+    message(
+      FATAL_ERROR "Set KVCLIENT_INCLUDE_DIR and KVCLIENT_LIBRARY to the SDK")
+  endif()
+  target_sources(mooncake_store_client_objects PRIVATE kvclient_backend.cpp)
+  target_include_directories(mooncake_store_client_objects
+                             PRIVATE ${KVCLIENT_INCLUDE_DIR})
+  target_compile_definitions(mooncake_store_client_objects
+                             PRIVATE MOONCAKE_WITH_KVCLIENT=1)
+endif()
 set_target_properties(mooncake_store_client_objects
                       PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_include_directories(
@@ -657,6 +679,9 @@ add_library(
   $<TARGET_OBJECTS:mooncake_store_master_objects>
   $<TARGET_OBJECTS:mooncake_store_client_objects>)
 target_include_directories(mooncake_store PUBLIC ${MOONCAKE_STORE_INCLUDE_DIRS})
+if(MOONCAKE_WITH_KVCLIENT)
+  target_link_libraries(mooncake_store PRIVATE ${KVCLIENT_LIBRARY})
+endif()
 target_link_libraries(
   mooncake_store
   PUBLIC mooncake_local_ssd

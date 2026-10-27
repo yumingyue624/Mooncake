@@ -2484,6 +2484,10 @@ tl::expected<void, ErrorCode> RealClient::put_internal(
     const std::string &key, std::span<const char> value,
     const ReplicateConfig &config,
     const std::shared_ptr<ClientBufferAllocator> &client_buffer_allocator) {
+    if (client_ && client_->HasExternalStoreBackend()) {
+        LOG(ERROR) << "External store does not support internal buffer staging";
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
     if (config.prefer_alloc_in_same_node) {
         LOG(ERROR) << "prefer_alloc_in_same_node is not supported.";
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
@@ -2560,6 +2564,10 @@ tl::expected<void, ErrorCode> RealClient::put_batch_internal(
     const std::vector<std::span<const char>> &values,
     const ReplicateConfig &config,
     const std::shared_ptr<ClientBufferAllocator> &client_buffer_allocator) {
+    if (client_ && client_->HasExternalStoreBackend()) {
+        LOG(ERROR) << "External store does not support internal buffer staging";
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
     if (config.prefer_alloc_in_same_node) {
         LOG(ERROR) << "prefer_alloc_in_same_node is not supported.";
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
@@ -2671,6 +2679,10 @@ tl::expected<void, ErrorCode> RealClient::put_parts_internal(
     const std::string &key, const std::vector<std::span<const char>> &values,
     const ReplicateConfig &config,
     const std::shared_ptr<ClientBufferAllocator> &client_buffer_allocator) {
+    if (client_ && client_->HasExternalStoreBackend()) {
+        LOG(ERROR) << "External store does not support internal buffer staging";
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
     if (config.prefer_alloc_in_same_node) {
         LOG(ERROR) << "prefer_alloc_in_same_node is not supported.";
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
@@ -5430,6 +5442,10 @@ tl::expected<void, ErrorCode> RealClient::upsert_internal(
     const std::string &key, std::span<const char> value,
     const ReplicateConfig &config,
     std::shared_ptr<ClientBufferAllocator> client_buffer_allocator) {
+    if (client_ && client_->HasExternalStoreBackend()) {
+        LOG(ERROR) << "External store does not support internal buffer staging";
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
     if (config.prefer_alloc_in_same_node) {
         LOG(ERROR) << "prefer_alloc_in_same_node is not supported.";
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
@@ -5741,6 +5757,10 @@ tl::expected<void, ErrorCode> RealClient::upsert_batch_internal(
     const std::vector<std::span<const char>> &values,
     const ReplicateConfig &config,
     std::shared_ptr<ClientBufferAllocator> client_buffer_allocator) {
+    if (client_ && client_->HasExternalStoreBackend()) {
+        LOG(ERROR) << "External store does not support internal buffer staging";
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
     if (config.prefer_alloc_in_same_node) {
         LOG(ERROR) << "prefer_alloc_in_same_node is not supported.";
         return tl::unexpected(ErrorCode::INVALID_PARAMS);

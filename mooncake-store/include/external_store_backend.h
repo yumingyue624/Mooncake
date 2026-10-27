@@ -1,0 +1,36 @@
+#pragma once
+
+#include <cstdint>
+#include <memory>
+#include <string>
+#include <vector>
+#include <ylt/util/tl/expected.hpp>
+
+#include "types.h"
+
+namespace mooncake {
+
+class ExternalStoreBackend {
+   public:
+    virtual ~ExternalStoreBackend() = default;
+    virtual tl::expected<void*, ErrorCode> Put(
+        const std::string& tenant, const ObjectKey& key,
+        const std::vector<Slice>& slices) = 0;
+    virtual tl::expected<void*, ErrorCode> BatchPut(
+        const std::string& tenant, const std::vector<ObjectKey>& keys,
+        const std::vector<std::vector<Slice>>& batched_slices) = 0;
+    virtual tl::expected<void*, ErrorCode> Remove(const std::string& tenant,
+                                                  const ObjectKey& key) = 0;
+    virtual tl::expected<void*, ErrorCode> BatchRemove(
+        const std::string& tenant, const std::vector<ObjectKey>& keys) = 0;
+    // Consumes a task returned by this backend exactly once. Results retain
+    // input order. Return only once the source is no longer being accessed.
+    virtual std::vector<tl::expected<void, ErrorCode>> Wait(
+        void* task, uint64_t timeout_ms) = 0;
+};
+
+// Empty path selects native-only. An unknown/unavailable backend fails startup.
+tl::expected<std::shared_ptr<ExternalStoreBackend>, ErrorCode>
+CreateExternalStoreBackend(const std::string& path, uint64_t& wait_timeout_ms);
+
+}  // namespace mooncake
