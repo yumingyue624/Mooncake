@@ -65,8 +65,8 @@ struct KVClientBackend::Impl {
     // globally collision-free, persistent mapping for arbitrary string keys.
     std::map<kv::CacheKey, std::string> key_owners;
 
-    tl::expected<kv::CacheKey, ErrorCode> Key(const std::string& tenant,
-                                              const std::string& key) {
+    tl::expected<kv::CacheKey, ErrorCode> EncodeKey(const std::string& tenant,
+                                                    const std::string& key) {
         if (key.empty()) return tl::unexpected(ErrorCode::INVALID_KEY);
         const auto identity = TenantId(tenant).MakeScopedKey(key);
         const auto digest = XXH3_64bits(identity.data(), identity.size());
@@ -97,98 +97,41 @@ struct KVClientBackend::Impl {
         }
     }
 
-    tl::expected<void*, ErrorCode> Submit(
-        const std::string& tenant, const std::vector<ObjectKey>& keys,
-        const std::vector<std::vector<Slice>>* slices, bool batch) {
-        std::lock_guard<std::mutex> lock(mutex);
-        if (disabled)
-            return tl::unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
-        if (keys.empty() || (slices && slices->size() != keys.size())) {
-            return tl::unexpected(ErrorCode::INVALID_PARAMS);
-        }
-        auto task = std::make_unique<Task>();
-        task->remove = slices == nullptr;
-        task->results =
-            Results(keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
-        std::vector<kv::KVBuffer> entries;
-        std::vector<kv::CacheKey> delete_keys;
-        entries.reserve(keys.size());
-        delete_keys.reserve(keys.size());
-        task->indices.reserve(keys.size());
-        task->regions.reserve(keys.size());
-        for (size_t i = 0; i < keys.size(); ++i) {
-            auto key = Key(tenant, keys[i]);
-            if (!key) {
-                task->results[i] = tl::unexpected(key.error());
-                continue;
-            }
-            if (!slices) {
-                delete_keys.push_back(*key);
-                task->indices.push_back(i);
-                continue;
-            }
-            // Offset zero is deliberately limited to one Slice per object.
-            if ((*slices)[i].size() != 1) continue;
-            const auto& slice = (*slices)[i][0];
-            const auto ptr = reinterpret_cast<uintptr_t>(slice.ptr);
-            constexpr size_t kMaxProtocolBufferBytes = 0xffffff;
-            if (!slice.ptr || !slice.size ||
-                slice.size > kMaxProtocolBufferBytes ||
-                slice.size % kv::kAlignmentBytes)
-                continue;
-            auto it = registered.upper_bound(ptr);
-            if (it == registered.begin()) continue;
-            auto region = std::prev(it)->second;
-            const auto& memory = region->memory;
-            if (!Contains(memory.region.addr, memory.region.size, ptr,
-                          slice.size))
-                continue;
-            if (memory.region.memoryType == kv::MemoryType::DEVICE &&
-                ptr % kv::kAlignmentBytes)
-                continue;
-            kv::KVBuffer entry;
-            entry.key = *key;
-            entry.buffer = {memory.region, memory.handle};
-            entry.buffer.region.addr = ptr;
-            entry.buffer.region.size = slice.size;
-            entry.offset = 0;
-            // mrKey is resolved by the SDK from the registered MRHandle.
-            entries.push_back(entry);
-            task->indices.push_back(i);
-            task->regions.push_back(region);
-        }
-        // Publish ownership before SDK submission: allocation of the task map
-        // must not fail after the SDK has started reading caller memory.
+    std::shared_ptr<Region> FindRegion(const Slice& slice) {
+        const auto ptr = reinterpret_cast<uintptr_t>(slice.ptr);
+        constexpr size_t kMaxProtocolBufferBytes = 0xffffff;
+        if (!slice.ptr || !slice.size || slice.size > kMaxProtocolBufferBytes ||
+            slice.size % kv::kAlignmentBytes)
+            return nullptr;
+        auto it = registered.upper_bound(ptr);
+        if (it == registered.begin()) return nullptr;
+        auto region = std::prev(it)->second;
+        const auto& memory = region->memory;
+        if (!Contains(memory.region.addr, memory.region.size, ptr,
+                      slice.size) ||
+            (memory.region.memoryType == kv::MemoryType::DEVICE &&
+             ptr % kv::kAlignmentBytes))
+            return nullptr;
+        return region;
+    }
+
+    Task& TrackTask(std::unique_ptr<Task> task) {
+        // Establish ownership before the SDK can access caller memory.
         void* token = &task->id;
-        auto inserted = tasks.emplace(token, std::move(task)).first;
-        auto& submitted = *inserted->second;
-        for (auto& region : submitted.regions) ++region->inflight;
-        if (!submitted.indices.empty()) {
-            kv::Status status;
-            try {
-                if (submitted.remove) {
-                    status = sdk->DeleteAsync(delete_keys, submitted.id);
-                } else if (batch) {
-                    status = sdk->BatchStoreAsync(entries, submitted.id);
-                } else {
-                    status = sdk->StoreAsync(entries, submitted.id);
-                }
-            } catch (...) {
-                StopAccess();
-                status = kv::Status::Error(kv::StatusCode::INTERNAL_ERROR,
-                                           "SDK submission threw");
-            }
-            if (!status.ok() && submitted.id == kv::kInvalidTaskId) {
-                for (auto i : submitted.indices) {
-                    submitted.results[i] =
-                        tl::unexpected(ConvertStatus(status));
-                }
-                for (auto& region : submitted.regions) --region->inflight;
-                submitted.regions.clear();
-                submitted.indices.clear();
-            }
+        auto& tracked = *tasks.emplace(token, std::move(task)).first->second;
+        for (auto& region : tracked.regions) ++region->inflight;
+        return tracked;
+    }
+
+    void* FinishSubmission(Task& task, const kv::Status& status) {
+        if (!status.ok() && task.id == kv::kInvalidTaskId) {
+            for (auto index : task.indices)
+                task.results[index] = tl::unexpected(ConvertStatus(status));
+            for (auto& region : task.regions) --region->inflight;
+            task.regions.clear();
+            task.indices.clear();
         }
-        return token;
+        return &task.id;
     }
 };
 
@@ -206,24 +149,144 @@ KVClientBackend::~KVClientBackend() {
 tl::expected<void*, ErrorCode> KVClientBackend::Put(
     const std::string& tenant, const ObjectKey& key,
     const std::vector<Slice>& slices) {
-    const std::vector<std::vector<Slice>> batch{slices};
-    return impl_->Submit(tenant, {key}, &batch, false);
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    if (impl_->disabled)
+        return tl::unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    auto external_key = impl_->EncodeKey(tenant, key);
+    if (!external_key) return tl::unexpected(external_key.error());
+    if (slices.size() != 1) return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    auto region = impl_->FindRegion(slices[0]);
+    if (!region) return tl::unexpected(ErrorCode::INVALID_PARAMS);
+
+    kv::KVBuffer entry;
+    entry.key = *external_key;
+    entry.buffer = {region->memory.region, region->memory.handle};
+    entry.buffer.region.addr = reinterpret_cast<uintptr_t>(slices[0].ptr);
+    entry.buffer.region.size = slices[0].size;
+    entry.offset = 0;
+    // The SDK resolves mrKey from the pre-registered MRHandle.
+    std::vector<kv::KVBuffer> entries{entry};
+    auto pending = std::make_unique<Impl::Task>();
+    pending->results = Results(1, tl::unexpected(ErrorCode::INVALID_PARAMS));
+    pending->indices = {0};
+    pending->regions = {region};
+    auto& task = impl_->TrackTask(std::move(pending));
+    kv::Status status;
+    try {
+        status = impl_->sdk->StoreAsync(entries, task.id);
+    } catch (...) {
+        impl_->StopAccess();
+        status = kv::Status::Error(kv::StatusCode::INTERNAL_ERROR,
+                                   "SDK StoreAsync threw");
+    }
+    return impl_->FinishSubmission(task, status);
 }
 
 tl::expected<void*, ErrorCode> KVClientBackend::BatchPut(
     const std::string& tenant, const std::vector<ObjectKey>& keys,
-    const std::vector<std::vector<Slice>>& slices) {
-    return impl_->Submit(tenant, keys, &slices, true);
+    const std::vector<std::vector<Slice>>& batched_slices) {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    if (impl_->disabled)
+        return tl::unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    if (keys.empty() || keys.size() != batched_slices.size())
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+
+    auto pending = std::make_unique<Impl::Task>();
+    pending->results =
+        Results(keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
+    std::vector<kv::KVBuffer> entries;
+    entries.reserve(keys.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        auto external_key = impl_->EncodeKey(tenant, keys[i]);
+        if (!external_key) {
+            pending->results[i] = tl::unexpected(external_key.error());
+            continue;
+        }
+        if (batched_slices[i].size() != 1) continue;
+        const auto& slice = batched_slices[i][0];
+        auto region = impl_->FindRegion(slice);
+        if (!region) continue;
+        kv::KVBuffer entry;
+        entry.key = *external_key;
+        entry.buffer = {region->memory.region, region->memory.handle};
+        entry.buffer.region.addr = reinterpret_cast<uintptr_t>(slice.ptr);
+        entry.buffer.region.size = slice.size;
+        entry.offset = 0;
+        entries.push_back(entry);
+        pending->indices.push_back(i);
+        pending->regions.push_back(region);
+    }
+    auto& task = impl_->TrackTask(std::move(pending));
+    kv::Status status;
+    if (!entries.empty()) {
+        try {
+            status = impl_->sdk->BatchStoreAsync(entries, task.id);
+        } catch (...) {
+            impl_->StopAccess();
+            status = kv::Status::Error(kv::StatusCode::INTERNAL_ERROR,
+                                       "SDK BatchStoreAsync threw");
+        }
+    }
+    return impl_->FinishSubmission(task, status);
 }
 
 tl::expected<void*, ErrorCode> KVClientBackend::Remove(
     const std::string& tenant, const ObjectKey& key) {
-    return impl_->Submit(tenant, {key}, nullptr, false);
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    if (impl_->disabled)
+        return tl::unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    auto external_key = impl_->EncodeKey(tenant, key);
+    if (!external_key) return tl::unexpected(external_key.error());
+    std::vector<kv::CacheKey> keys{*external_key};
+    auto pending = std::make_unique<Impl::Task>();
+    pending->remove = true;
+    pending->results = Results(1, tl::unexpected(ErrorCode::INVALID_PARAMS));
+    pending->indices = {0};
+    auto& task = impl_->TrackTask(std::move(pending));
+    kv::Status status;
+    try {
+        status = impl_->sdk->DeleteAsync(keys, task.id);
+    } catch (...) {
+        impl_->StopAccess();
+        status = kv::Status::Error(kv::StatusCode::INTERNAL_ERROR,
+                                   "SDK DeleteAsync threw");
+    }
+    return impl_->FinishSubmission(task, status);
 }
 
 tl::expected<void*, ErrorCode> KVClientBackend::BatchRemove(
     const std::string& tenant, const std::vector<ObjectKey>& keys) {
-    return impl_->Submit(tenant, keys, nullptr, true);
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    if (impl_->disabled)
+        return tl::unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    if (keys.empty()) return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    auto pending = std::make_unique<Impl::Task>();
+    pending->remove = true;
+    pending->results =
+        Results(keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
+    std::vector<kv::CacheKey> external_keys;
+    external_keys.reserve(keys.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        auto external_key = impl_->EncodeKey(tenant, keys[i]);
+        if (!external_key) {
+            pending->results[i] = tl::unexpected(external_key.error());
+            continue;
+        }
+        external_keys.push_back(*external_key);
+        pending->indices.push_back(i);
+    }
+    auto& task = impl_->TrackTask(std::move(pending));
+    kv::Status status;
+    if (!external_keys.empty()) {
+        try {
+            status = impl_->sdk->DeleteAsync(external_keys, task.id);
+        } catch (...) {
+            impl_->StopAccess();
+            status = kv::Status::Error(kv::StatusCode::INTERNAL_ERROR,
+                                       "SDK DeleteAsync threw");
+        }
+    }
+    return impl_->FinishSubmission(task, status);
 }
 
 std::vector<tl::expected<void, ErrorCode>> KVClientBackend::Wait(

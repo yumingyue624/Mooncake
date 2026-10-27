@@ -142,6 +142,22 @@ TEST(KVClientBackendTest, UnregisteredWritesNeverRegisterOrAccessPayload) {
     EXPECT_FALSE(backend.BatchPut("tenant-a", {"A"}, {}));
 }
 
+TEST(KVClientBackendTest, SinglePutRejectsInvalidInputBeforeSubmission) {
+    auto sdk = std::make_shared<FakeSdk>();
+    KVClientBackend backend(sdk);
+    alignas(512) char data[512]{};
+    auto result = backend.Put("tenant-a", "", {{data, sizeof(data)}});
+    ASSERT_FALSE(result);
+    EXPECT_EQ(result.error(), ErrorCode::INVALID_KEY);
+    EXPECT_FALSE(backend.Put("tenant-a", "A", {}));
+    EXPECT_FALSE(backend.Put("tenant-a", "A", {{data, sizeof(data)}}));
+    EXPECT_FALSE(backend.Remove("tenant-a", ""));
+    EXPECT_EQ(sdk->registers, 0);
+    EXPECT_EQ(sdk->stores, 0);
+    EXPECT_EQ(sdk->deletes, 0);
+    EXPECT_EQ(sdk->waits, 0);
+}
+
 TEST(KVClientBackendTest, WaitAndTaskErrorsCannotBecomeSuccessfulEntries) {
     auto sdk = std::make_shared<FakeSdk>();
     {
