@@ -21,9 +21,10 @@ ErrorCode ConvertStatus(const kv::Status& status) {
             return ErrorCode::OK;
         case kv::StatusCode::INVALID_ARGUMENT:
         case kv::StatusCode::BUFFER_NOT_REGISTERED:
+            return ErrorCode::INVALID_PARAMS;
         case kv::StatusCode::BUFFER_NOT_SUPPORTED:
         case kv::StatusCode::UNSUPPORTED:
-            return ErrorCode::INVALID_PARAMS;
+            return ErrorCode::NOT_SUPPORTED;
         case kv::StatusCode::NOT_FOUND:
         case kv::StatusCode::CQE_KEY_NOT_EXIST:
         case kv::StatusCode::ENTRY_KEY_NOT_FOUND:
@@ -291,18 +292,29 @@ tl::expected<void*, ErrorCode> KVClientBackend::BatchRemove(
 
 std::vector<tl::expected<void, ErrorCode>> KVClientBackend::Wait(
     void* token, uint64_t timeout_ms) {
-    std::lock_guard<std::mutex> lock(impl_->mutex);
-    auto it = impl_->tasks.find(token);
-    if (it == impl_->tasks.end())
-        return {tl::unexpected(ErrorCode::INVALID_PARAMS)};
-    auto& task = *it->second;
+    std::unique_ptr<Impl::Task> pending;
+    bool disabled;
+    {
+        std::lock_guard<std::mutex> lock(impl_->mutex);
+        auto it = impl_->tasks.find(token);
+        if (it == impl_->tasks.end())
+            return {tl::unexpected(ErrorCode::INVALID_PARAMS)};
+        pending = std::move(it->second);
+        impl_->tasks.erase(it);
+        disabled = impl_->disabled;
+    }
+    auto& task = *pending;
+    kv::TaskResult result;
+    kv::Status status;
     if (task.id != kv::kInvalidTaskId) {
-        kv::TaskResult result;
-        auto status =
-            impl_->disabled
-                ? kv::Status::Error(kv::StatusCode::CANCELED, "SDK stopped")
-                : impl_->sdk->Wait(task.id, timeout_ms, result);
+        status = disabled ? kv::Status::Error(kv::StatusCode::CANCELED,
+                                              "SDK stopped")
+                          : impl_->sdk->Wait(task.id, timeout_ms, result);
         if (status.ok() && !result.status.ok()) status = result.status;
+    }
+    // SDK waiting must not hold the task/registration bookkeeping lock.
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    if (task.id != kv::kInvalidTaskId) {
         // The SDK's timeout removes the task record before its asynchronous
         // channel drain finishes. Close all SDK channels before releasing MRs.
         if (!status.ok() && !task.remove && !impl_->disabled)
@@ -326,7 +338,6 @@ std::vector<tl::expected<void, ErrorCode>> KVClientBackend::Wait(
     }
     for (auto& region : task.regions) --region->inflight;
     auto results = std::move(task.results);
-    impl_->tasks.erase(it);
     return results;
 }
 

@@ -60,7 +60,6 @@ namespace mooncake {
 
 void Client::SetExternalStoreBackend(
     std::shared_ptr<ExternalStoreBackend> backend, uint64_t wait_timeout_ms) {
-    std::lock_guard<std::mutex> lock(external_store_mutex_);
     if (!wait_timeout_ms) {
         throw std::invalid_argument("External wait timeout must be positive");
     }
@@ -2033,9 +2032,6 @@ bool Client::RedirectToHotCache(const std::string& key,
 tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
                                           std::vector<Slice>& slices,
                                           const ReplicateConfig& config) {
-    std::unique_lock<std::mutex> external_lock(external_store_mutex_,
-                                               std::defer_lock);
-    if (external_store_backend_) external_lock.lock();
     if (external_store_backend_ && !ValidateExternalWrite({key}, {slices})) {
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
@@ -2286,9 +2282,6 @@ Client::DiskReplicaHealResult Client::healDanglingLocalDiskReplica(
 tl::expected<void, ErrorCode> Client::Upsert(const ObjectKey& key,
                                              std::vector<Slice>& slices,
                                              const ReplicateConfig& config) {
-    std::unique_lock<std::mutex> external_lock(external_store_mutex_,
-                                               std::defer_lock);
-    if (external_store_backend_) external_lock.lock();
     if (external_store_backend_ && !ValidateExternalWrite({key}, {slices})) {
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
@@ -3727,9 +3720,6 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPut(
     const std::vector<ObjectKey>& keys,
     std::vector<std::vector<Slice>>& batched_slices,
     const ReplicateConfig& config, const WriteBufferStager& stager) {
-    std::unique_lock<std::mutex> external_lock(external_store_mutex_,
-                                               std::defer_lock);
-    if (external_store_backend_) external_lock.lock();
     if (external_store_backend_ &&
         (stager || !ValidateExternalWrite(keys, batched_slices))) {
         return std::vector<tl::expected<void, ErrorCode>>(
@@ -3816,9 +3806,6 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchUpsert(
     const std::vector<ObjectKey>& keys,
     std::vector<std::vector<Slice>>& batched_slices,
     const ReplicateConfig& config, const WriteBufferStager& stager) {
-    std::unique_lock<std::mutex> external_lock(external_store_mutex_,
-                                               std::defer_lock);
-    if (external_store_backend_) external_lock.lock();
     if (external_store_backend_ &&
         (stager || !ValidateExternalWrite(keys, batched_slices))) {
         return std::vector<tl::expected<void, ErrorCode>>(
@@ -3942,10 +3929,6 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPutRevoke(
 }
 
 tl::expected<void, ErrorCode> Client::Remove(const ObjectKey& key, bool force) {
-    std::unique_lock<std::mutex> external_lock(external_store_mutex_,
-                                               std::defer_lock);
-    if (external_store_backend_) external_lock.lock();
-
     if (hot_cache_) {
         hot_cache_->BumpKeyGeneration(key);
     }
@@ -4037,10 +4020,6 @@ tl::expected<long, ErrorCode> Client::RemoveAll(bool force) {
 
 std::vector<tl::expected<void, ErrorCode>> Client::BatchRemove(
     const std::vector<ObjectKey>& keys, bool force) {
-    std::unique_lock<std::mutex> external_lock(external_store_mutex_,
-                                               std::defer_lock);
-    if (external_store_backend_) external_lock.lock();
-
     if (hot_cache_) {
         hot_cache_->BumpKeyGenerations(keys);
     }

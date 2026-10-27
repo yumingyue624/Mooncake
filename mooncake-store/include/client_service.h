@@ -883,9 +883,6 @@ class Client {
    private:
     std::shared_ptr<ExternalStoreBackend> external_store_backend_;
     uint64_t external_wait_timeout_ms_ = 30000;
-    // A first implementation serializes this client's writes and deletes.
-    // It does not impose ordering across different clients.
-    std::mutex external_store_mutex_;
     /**
      * @brief Internal helper functions for initialization and data transfer
      */

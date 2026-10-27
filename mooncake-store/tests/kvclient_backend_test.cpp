@@ -2,6 +2,12 @@
 #include "kv_client.h"
 
 #include <gtest/gtest.h>
+#include <chrono>
+#include <condition_variable>
+#include <functional>
+#include <future>
+#include <mutex>
+#include <thread>
 
 namespace mooncake {
 namespace {
@@ -10,6 +16,7 @@ class FakeSdk final : public kv::KvClient {
     int registers = 0, stores = 0, waits = 0, deletes = 0, stops = 0;
     bool reject = false, timeout = false;
     kv::Status task_status;
+    std::function<void()> wait_hook;
     std::vector<kv::Status> completion;
     std::vector<kv::KVBuffer> entries;
     std::vector<kv::CacheKey> removed;
@@ -64,6 +71,7 @@ class FakeSdk final : public kv::KvClient {
     bool Check(kv::TaskId) override { return true; }
     kv::Status Wait(kv::TaskId id, uint64_t, kv::TaskResult& result) override {
         ++waits;
+        if (wait_hook) wait_hook();
         if (timeout)
             return kv::Status::Error(kv::StatusCode::TIMEOUT, "timeout");
         result.status = task_status;
@@ -140,6 +148,43 @@ TEST(KVClientBackendTest, UnregisteredWritesNeverRegisterOrAccessPayload) {
     EXPECT_EQ(sdk->registers, 0);
     EXPECT_EQ(sdk->stores, 0);
     EXPECT_FALSE(backend.BatchPut("tenant-a", {"A"}, {}));
+}
+
+TEST(KVClientBackendTest, WaitingTaskDoesNotBlockAnotherSubmission) {
+    auto sdk = std::make_shared<FakeSdk>();
+    KVClientBackend backend(sdk);
+    std::mutex mutex;
+    std::condition_variable condition;
+    bool entered = false, release = false;
+    sdk->wait_hook = [&] {
+        std::unique_lock<std::mutex> lock(mutex);
+        entered = true;
+        condition.notify_all();
+        condition.wait(lock, [&] { return release; });
+    };
+    auto task = backend.Remove("tenant-a", "A");
+    ASSERT_TRUE(task);
+    std::thread waiting([&] { backend.Wait(*task, 100); });
+    bool started;
+    {
+        std::unique_lock<std::mutex> lock(mutex);
+        started = condition.wait_for(lock, std::chrono::seconds(1),
+                                     [&] { return entered; });
+    }
+    auto next = std::async(std::launch::async,
+                           [&] { return backend.Remove("tenant-a", "B"); });
+    const auto readiness = next.wait_for(std::chrono::seconds(1));
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        release = true;
+    }
+    condition.notify_all();
+    waiting.join();
+    auto next_task = next.get();
+    EXPECT_TRUE(started);
+    EXPECT_EQ(readiness, std::future_status::ready);
+    ASSERT_TRUE(next_task);
+    EXPECT_TRUE(backend.Wait(*next_task, 100)[0]);
 }
 
 TEST(KVClientBackendTest, SinglePutRejectsInvalidInputBeforeSubmission) {
