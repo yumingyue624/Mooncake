@@ -1,6 +1,5 @@
 #pragma once
 
-#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -10,26 +9,6 @@
 #include "types.h"
 
 namespace mooncake {
-
-struct MemoryRegion {
-    const void* base = nullptr;
-    uint64_t capacity = 0;
-    std::string memory_domain;
-    int32_t device_id = -1;
-    std::shared_ptr<const void> access_lease;
-};
-
-struct BufferInfo {
-    uint64_t capacity = 0;
-    std::string memory_domain;
-    int32_t device_id = -1;
-};
-
-class StorageBuffer {
-   public:
-    virtual ~StorageBuffer() = default;
-    virtual BufferInfo GetInfo() const = 0;
-};
 
 class ExternalStoreBackend {
    public:

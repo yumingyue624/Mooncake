@@ -43,17 +43,10 @@ bool Contains(uintptr_t base, size_t capacity, uintptr_t ptr, size_t size) {
 }  // namespace
 
 struct KVClientBackend::Impl {
-    struct Region : StorageBuffer {
+    struct Region {
         kv::RegisteredMemory memory;
         std::shared_ptr<const void> access_lease;
         size_t inflight = 0;
-        BufferInfo GetInfo() const override {
-            return {memory.region.size,
-                    memory.region.memoryType == kv::MemoryType::DEVICE
-                        ? "device"
-                        : "host",
-                    memory.region.deviceId};
-        }
     };
     struct Task {
         kv::TaskId id = kv::kInvalidTaskId;
