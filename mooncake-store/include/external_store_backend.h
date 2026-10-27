@@ -34,16 +34,16 @@ class StorageBuffer {
 class ExternalStoreBackend {
    public:
     virtual ~ExternalStoreBackend() = default;
-    virtual tl::expected<void*, ErrorCode> Put(const std::string& tenant,
-                                               const ObjectKey&,
-                                               const std::vector<Slice>&) = 0;
+    virtual tl::expected<void*, ErrorCode> Put(
+        const std::string& tenant, const ObjectKey& key,
+        const std::vector<Slice>& slices) = 0;
     virtual tl::expected<void*, ErrorCode> BatchPut(
-        const std::string& tenant, const std::vector<ObjectKey>&,
-        const std::vector<std::vector<Slice>>&) = 0;
+        const std::string& tenant, const std::vector<ObjectKey>& keys,
+        const std::vector<std::vector<Slice>>& batched_slices) = 0;
     virtual tl::expected<void*, ErrorCode> Remove(const std::string& tenant,
-                                                  const ObjectKey&) = 0;
+                                                  const ObjectKey& key) = 0;
     virtual tl::expected<void*, ErrorCode> BatchRemove(
-        const std::string& tenant, const std::vector<ObjectKey>&) = 0;
+        const std::string& tenant, const std::vector<ObjectKey>& keys) = 0;
     // Consumes a task returned by this backend exactly once. Results retain
     // input order. Return only once the source is no longer being accessed.
     virtual std::vector<tl::expected<void, ErrorCode>> Wait(

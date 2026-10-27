@@ -19,17 +19,18 @@ class KVClientBackend final : public ExternalStoreBackend {
     using Quiesce = std::function<bool()>;
     KVClientBackend(std::shared_ptr<kv::KvClient> sdk, Quiesce quiesce);
     ~KVClientBackend() override;
-    tl::expected<void*, ErrorCode> Put(const std::string& tenant,
-                                       const ObjectKey&,
-                                       const std::vector<Slice>&) override;
+    tl::expected<void*, ErrorCode> Put(
+        const std::string& tenant, const ObjectKey& key,
+        const std::vector<Slice>& slices) override;
     tl::expected<void*, ErrorCode> BatchPut(
-        const std::string& tenant, const std::vector<ObjectKey>&,
-        const std::vector<std::vector<Slice>>&) override;
+        const std::string& tenant, const std::vector<ObjectKey>& keys,
+        const std::vector<std::vector<Slice>>& batched_slices) override;
     tl::expected<void*, ErrorCode> Remove(const std::string& tenant,
-                                          const ObjectKey&) override;
+                                          const ObjectKey& key) override;
     tl::expected<void*, ErrorCode> BatchRemove(
-        const std::string& tenant, const std::vector<ObjectKey>&) override;
-    std::vector<tl::expected<void, ErrorCode>> Wait(void*, uint64_t) override;
+        const std::string& tenant, const std::vector<ObjectKey>& keys) override;
+    std::vector<tl::expected<void, ErrorCode>> Wait(
+        void* task, uint64_t timeout_ms) override;
 
    private:
     struct Impl;
