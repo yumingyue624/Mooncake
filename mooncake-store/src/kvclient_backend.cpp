@@ -62,9 +62,6 @@ struct KVClientBackend::Impl {
     bool disabled = false;
     std::map<uintptr_t, std::shared_ptr<Region>> registered;
     std::unordered_map<void*, std::unique_ptr<Task>> tasks;
-    // Prototype collision detection is process-local. It does not establish a
-    // globally collision-free, persistent mapping for arbitrary string keys.
-    std::map<kv::CacheKey, std::string> key_owners;
 
     tl::expected<kv::CacheKey, ErrorCode> EncodeKey(const std::string& tenant,
                                                     const std::string& key) {
@@ -74,10 +71,6 @@ struct KVClientBackend::Impl {
         kv::CacheKey result;
         for (size_t i = 0; i < result.size(); ++i) {
             result[i] = static_cast<std::byte>((digest >> (i * 8)) & 0xff);
-        }
-        auto [it, inserted] = key_owners.emplace(result, identity);
-        if (!inserted && it->second != identity) {
-            return tl::unexpected(ErrorCode::INVALID_KEY);
         }
         return result;
     }
