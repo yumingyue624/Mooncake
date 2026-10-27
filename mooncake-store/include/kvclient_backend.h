@@ -10,9 +10,7 @@ class KvClient;
 
 namespace mooncake {
 
-// Built only with MOONCAKE_WITH_KVCLIENT. The SDK remains outside the public
-// ExternalStoreBackend interface. SDK shutdown must stop all source access;
-// a failed barrier is fatal rather than returning an unsafe caller buffer.
+// Built only with MOONCAKE_WITH_KVCLIENT. SDK types stay in the implementation.
 class KVClientBackend final : public ExternalStoreBackend {
    public:
     explicit KVClientBackend(std::shared_ptr<kv::KvClient> sdk);

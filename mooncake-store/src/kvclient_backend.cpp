@@ -51,7 +51,6 @@ struct KVClientBackend::Impl {
     };
     struct Task {
         kv::TaskId id = kv::kInvalidTaskId;
-        bool remove = false;
         Results results;
         std::vector<size_t> indices;
         std::vector<std::shared_ptr<Region>> regions;
@@ -233,7 +232,6 @@ tl::expected<void*, ErrorCode> KVClientBackend::Remove(
     if (!external_key) return tl::unexpected(external_key.error());
     std::vector<kv::CacheKey> keys{*external_key};
     auto pending = std::make_unique<Impl::Task>();
-    pending->remove = true;
     pending->results = Results(1, tl::unexpected(ErrorCode::INVALID_PARAMS));
     pending->indices = {0};
     auto& task = impl_->TrackTask(std::move(pending));
@@ -255,7 +253,6 @@ tl::expected<void*, ErrorCode> KVClientBackend::BatchRemove(
         return tl::unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     if (keys.empty()) return tl::unexpected(ErrorCode::INVALID_PARAMS);
     auto pending = std::make_unique<Impl::Task>();
-    pending->remove = true;
     pending->results =
         Results(keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
     std::vector<kv::CacheKey> external_keys;
@@ -286,7 +283,6 @@ tl::expected<void*, ErrorCode> KVClientBackend::BatchRemove(
 std::vector<tl::expected<void, ErrorCode>> KVClientBackend::Wait(
     void* token, uint64_t timeout_ms) {
     std::unique_ptr<Impl::Task> pending;
-    bool disabled;
     {
         std::lock_guard<std::mutex> lock(impl_->mutex);
         auto it = impl_->tasks.find(token);
@@ -294,34 +290,27 @@ std::vector<tl::expected<void, ErrorCode>> KVClientBackend::Wait(
             return {tl::unexpected(ErrorCode::INVALID_PARAMS)};
         pending = std::move(it->second);
         impl_->tasks.erase(it);
-        disabled = impl_->disabled;
     }
     auto& task = *pending;
-    kv::TaskResult result;
-    kv::Status status;
     if (task.id != kv::kInvalidTaskId) {
-        status = disabled ? kv::Status::Error(kv::StatusCode::CANCELED,
-                                              "SDK stopped")
-                          : impl_->sdk->Wait(task.id, timeout_ms, result);
-        if (status.ok() && !result.status.ok()) status = result.status;
-    }
-    // SDK waiting must not hold the task/registration bookkeeping lock.
-    std::lock_guard<std::mutex> lock(impl_->mutex);
-    if (task.id != kv::kInvalidTaskId) {
-        // The SDK's timeout removes the task record before its asynchronous
-        // channel drain finishes. Close all SDK channels before releasing MRs.
-        if (!status.ok() && !task.remove && !impl_->disabled)
-            impl_->StopAccess();
+        kv::TaskResult result;
+        auto status = impl_->sdk->Wait(task.id, timeout_ms, result);
+        if (!status.ok()) {
+            LOG(WARNING) << "KVClient Wait failed: " << status.message;
+        } else {
+            status = result.status;
+        }
+        const bool has_entry_results =
+            status.ok() || status.code == kv::StatusCode::PARTIAL_FAILED;
         for (size_t i = 0; i < task.indices.size(); ++i) {
-            auto entry_status =
-                i < result.entryStatus.size()
-                    ? result.entryStatus[i]
-                    : kv::Status::Error(kv::StatusCode::INTERNAL_ERROR,
-                                        "missing SDK entry result");
-            if (!status.ok() && (result.entryStatus.empty() ||
-                                 status.code == kv::StatusCode::TIMEOUT ||
-                                 status.code == kv::StatusCode::CANCELED))
-                entry_status = status;
+            auto entry_status = status;
+            if (has_entry_results) {
+                entry_status =
+                    i < result.entryStatus.size()
+                        ? result.entryStatus[i]
+                        : kv::Status::Error(kv::StatusCode::INTERNAL_ERROR,
+                                            "missing SDK entry result");
+            }
             const auto error = ConvertStatus(entry_status);
             task.results[task.indices[i]] =
                 error == ErrorCode::OK
@@ -329,9 +318,11 @@ std::vector<tl::expected<void, ErrorCode>> KVClientBackend::Wait(
                     : tl::expected<void, ErrorCode>{tl::unexpected(error)};
         }
     }
-    for (auto& region : task.regions) --region->inflight;
-    auto results = std::move(task.results);
-    return results;
+    {
+        std::lock_guard<std::mutex> lock(impl_->mutex);
+        for (auto& region : task.regions) --region->inflight;
+    }
+    return std::move(task.results);
 }
 
 }  // namespace mooncake

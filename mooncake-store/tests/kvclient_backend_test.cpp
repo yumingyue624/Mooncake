@@ -16,6 +16,7 @@ class FakeSdk final : public kv::KvClient {
     int registers = 0, stores = 0, waits = 0, deletes = 0, stops = 0;
     bool reject = false, timeout = false;
     kv::Status task_status;
+    kv::Status wait_status;
     std::function<void()> wait_hook;
     std::vector<kv::Status> completion;
     std::vector<kv::KVBuffer> entries;
@@ -72,6 +73,9 @@ class FakeSdk final : public kv::KvClient {
     kv::Status Wait(kv::TaskId id, uint64_t, kv::TaskResult& result) override {
         ++waits;
         if (wait_hook) wait_hook();
+        if (!wait_status.ok() &&
+            wait_status.code != kv::StatusCode::PARTIAL_FAILED)
+            return wait_status;
         if (timeout)
             return kv::Status::Error(kv::StatusCode::TIMEOUT, "timeout");
         result.status = task_status;
@@ -80,7 +84,7 @@ class FakeSdk final : public kv::KvClient {
         else
             result.entryStatus.assign(id == 8 ? removed.size() : entries.size(),
                                       kv::Status::OK());
-        return {};
+        return wait_status;
     }
     kv::Status RegisterRegions(
         const std::vector<kv::MemoryRegion>& regions,
@@ -216,6 +220,55 @@ TEST(KVClientBackendTest, SinglePutRejectsInvalidInputBeforeSubmission) {
     EXPECT_EQ(sdk->stores, 0);
     EXPECT_EQ(sdk->deletes, 0);
     EXPECT_EQ(sdk->waits, 0);
+}
+
+TEST(KVClientBackendTest, WaitFailureReturnsErrorsAndAllowsFollowingTasks) {
+    auto sdk = std::make_shared<FakeSdk>();
+    KVClientBackend backend(sdk);
+    sdk->wait_status =
+        kv::Status::Error(kv::StatusCode::IO_ERROR, "I/O failed");
+    auto task = backend.BatchRemove("tenant-a", {"A", "B"});
+    ASSERT_TRUE(task);
+    auto results = backend.Wait(*task, 100);
+    ASSERT_EQ(results.size(), 2);
+    EXPECT_FALSE(results[0]);
+    EXPECT_FALSE(results[1]);
+    EXPECT_EQ(sdk->stops, 0);
+    sdk->wait_status = kv::Status::OK();
+    task = backend.Remove("tenant-a", "C");
+    ASSERT_TRUE(task);
+    EXPECT_TRUE(backend.Wait(*task, 100)[0]);
+}
+
+TEST(KVClientBackendTest, PartialFailureRetainsEntryResultsAndInputOrder) {
+    auto sdk = std::make_shared<FakeSdk>();
+    KVClientBackend backend(sdk);
+    sdk->task_status =
+        kv::Status::Error(kv::StatusCode::PARTIAL_FAILED, "partial");
+    sdk->wait_status = sdk->task_status;
+    sdk->completion = {kv::Status::OK(),
+                       kv::Status::Error(kv::StatusCode::IO_ERROR, "failed")};
+    auto task = backend.BatchRemove("tenant-a", {"A", "", "B"});
+    ASSERT_TRUE(task);
+    auto results = backend.Wait(*task, 100);
+    ASSERT_EQ(results.size(), 3);
+    EXPECT_TRUE(results[0]);
+    ASSERT_FALSE(results[1]);
+    EXPECT_EQ(results[1].error(), ErrorCode::INVALID_KEY);
+    EXPECT_FALSE(results[2]);
+    EXPECT_EQ(sdk->stops, 0);
+}
+
+TEST(KVClientBackendTest, MissingEntryResultsDoNotBecomeSuccessful) {
+    auto sdk = std::make_shared<FakeSdk>();
+    KVClientBackend backend(sdk);
+    sdk->completion = {kv::Status::OK()};
+    auto task = backend.BatchRemove("tenant-a", {"A", "B"});
+    ASSERT_TRUE(task);
+    auto results = backend.Wait(*task, 100);
+    ASSERT_EQ(results.size(), 2);
+    EXPECT_TRUE(results[0]);
+    EXPECT_FALSE(results[1]);
 }
 
 TEST(KVClientBackendTest, WaitAndTaskErrorsCannotBecomeSuccessfulEntries) {
