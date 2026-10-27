@@ -31,7 +31,7 @@ ErrorCode ConvertStatus(const kv::Status& status) {
             return ErrorCode::OBJECT_NOT_FOUND;
         case kv::StatusCode::TIMEOUT:
         case kv::StatusCode::CQE_IO_TIMEOUT:
-            return ErrorCode::RPC_TIMEOUT;
+            return ErrorCode::TRANSFER_FAIL;
         default:
             return ErrorCode::TRANSFER_FAIL;
     }

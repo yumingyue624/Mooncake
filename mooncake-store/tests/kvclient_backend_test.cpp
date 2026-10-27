@@ -165,13 +165,13 @@ TEST(KVClientBackendTest, WaitAndTaskErrorsCannotBecomeSuccessfulEntries) {
         sdk->timeout = true;
         auto task = backend.Remove("tenant-a", "A");
         ASSERT_TRUE(task);
-        EXPECT_EQ(backend.Wait(*task, 1)[0].error(), ErrorCode::RPC_TIMEOUT);
+        EXPECT_EQ(backend.Wait(*task, 1)[0].error(), ErrorCode::TRANSFER_FAIL);
         sdk->timeout = false;
         sdk->task_status =
             kv::Status::Error(kv::StatusCode::TIMEOUT, "timeout");
         task = backend.Remove("tenant-a", "A");
         ASSERT_TRUE(task);
-        EXPECT_EQ(backend.Wait(*task, 1)[0].error(), ErrorCode::RPC_TIMEOUT);
+        EXPECT_EQ(backend.Wait(*task, 1)[0].error(), ErrorCode::TRANSFER_FAIL);
     }
     EXPECT_EQ(sdk->stops, 1);
 }
