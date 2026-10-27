@@ -1,5 +1,5 @@
 #include "client_service.h"
-#include "external_store_operation.h"
+#include "external_store_backend.h"
 
 #include <boost/algorithm/string.hpp>
 #include <glog/logging.h>
@@ -28,6 +28,8 @@
 #include <sched.h>
 #include <thread>
 #include <set>
+#include <stdexcept>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 #include <ylt/struct_json/json_reader.h>
@@ -56,6 +58,16 @@
 
 namespace mooncake {
 
+void Client::SetExternalStoreBackend(
+    std::shared_ptr<ExternalStoreBackend> backend, uint64_t wait_timeout_ms) {
+    std::lock_guard<std::mutex> lock(external_store_mutex_);
+    if (!wait_timeout_ms) {
+        throw std::invalid_argument("External wait timeout must be positive");
+    }
+    external_store_backend_ = std::move(backend);
+    external_wait_timeout_ms_ = wait_timeout_ms;
+}
+
 std::optional<size_t> GetTransportRegistrationLimit(
     const std::string& protocol) {
     if (protocol == "efa" || protocol == "cxi") {
@@ -68,6 +80,52 @@ std::optional<size_t> GetTransportRegistrationLimit(
 }
 
 namespace {
+
+void CheckExternalResults(std::vector<tl::expected<void, ErrorCode>>& results,
+                          size_t count) {
+    if (results.size() != count) {
+        results = std::vector<tl::expected<void, ErrorCode>>(
+            count, tl::unexpected(ErrorCode::INTERNAL_ERROR));
+    }
+    for (size_t i = 0; i < results.size(); ++i) {
+        if (!results[i])
+            LOG(WARNING) << "External operation failed at index " << i << ": "
+                         << results[i].error();
+    }
+}
+
+std::vector<tl::expected<void, ErrorCode>> MergeExternalPutResults(
+    std::vector<tl::expected<void, ErrorCode>> native,
+    const std::vector<tl::expected<void, ErrorCode>>& external) {
+    if (native.size() != external.size()) {
+        native = std::vector<tl::expected<void, ErrorCode>>(
+            external.size(), tl::unexpected(ErrorCode::INTERNAL_ERROR));
+    }
+    for (size_t i = 0; i < external.size(); ++i) {
+        if (external[i]) native[i] = {};
+    }
+    return native;
+}
+
+bool ValidateExternalWrite(const std::vector<ObjectKey>& keys,
+                           const std::vector<std::vector<Slice>>& slices) {
+    if (keys.empty() || keys.size() != slices.size()) return false;
+    std::unordered_set<ObjectKey> seen;
+    for (size_t i = 0; i < keys.size(); ++i) {
+        if (keys[i].empty() || slices[i].empty() ||
+            !seen.insert(keys[i]).second)
+            return false;
+        size_t total = 0;
+        for (const auto& slice : slices[i]) {
+            if (!slice.ptr || !slice.size || slice.size > SIZE_MAX - total ||
+                slice.size >
+                    UINTPTR_MAX - reinterpret_cast<uintptr_t>(slice.ptr))
+                return false;
+            total += slice.size;
+        }
+    }
+    return true;
+}
 
 constexpr size_t kObjectChecksumD2HChunkSize = 8 * 1024 * 1024;
 constexpr auto kInitialLeaderReadyTimeout = std::chrono::seconds(30);
@@ -1171,7 +1229,13 @@ std::optional<std::shared_ptr<Client>> Client::Create(
         LOG(ERROR) << "Failed to initialize local hot cache";
     }
 
-    if (!client->InitExternalStoreBackend()) return std::nullopt;
+    const char* external_config = std::getenv("MOONCAKE_EXTERNAL_STORE_CONFIG");
+    if (external_config && *external_config) {
+        auto backend = CreateExternalStoreBackend(
+            external_config, client->external_wait_timeout_ms_);
+        if (!backend) return std::nullopt;
+        client->external_store_backend_ = std::move(*backend);
+    }
     return client;
 }
 
@@ -1969,11 +2033,10 @@ bool Client::RedirectToHotCache(const std::string& key,
 tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
                                           std::vector<Slice>& slices,
                                           const ReplicateConfig& config) {
-    std::unique_lock<std::recursive_mutex> external_lock(external_store_mutex_,
-                                                         std::defer_lock);
+    std::unique_lock<std::mutex> external_lock(external_store_mutex_,
+                                               std::defer_lock);
     if (external_store_backend_) external_lock.lock();
-    if (external_store_backend_ &&
-        !external_detail::ValidWrite({key}, {slices})) {
+    if (external_store_backend_ && !ValidateExternalWrite({key}, {slices})) {
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
 
@@ -2003,178 +2066,162 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
     }
 
     // Start put operation
-    tl::expected<void*, ErrorCode> external_task =
-        tl::unexpected(ErrorCode::INTERNAL_ERROR);
+    std::vector<tl::expected<void, ErrorCode>> external_results;
+    auto wait_external = [&](void* task) noexcept {
+        try {
+            external_results =
+                external_store_backend_->Wait(task, external_wait_timeout_ms_);
+        } catch (...) {
+            std::terminate();
+        }
+    };
+    // Drain an outstanding task even if the native path throws.
+    std::unique_ptr<void, decltype(wait_external)> external_task(nullptr,
+                                                                 wait_external);
     if (external_store_backend_) {
-        external_task = external_store_backend_->Put(tenant_id(), key, slices);
+        auto submitted = external_store_backend_->Put(tenant_id(), key, slices);
+        if (submitted && *submitted) {
+            external_task.reset(*submitted);
+        } else {
+            external_results.assign(
+                1, tl::unexpected(submitted ? ErrorCode::INTERNAL_ERROR
+                                            : submitted.error()));
+        }
     }
-    tl::expected<void, ErrorCode> native_result;
-    try {
-        do {
-            auto start_result =
-                master_client_.PutStart(key, slice_lengths, client_cfg);
-            if (!start_result &&
-                start_result.error() == ErrorCode::OBJECT_ALREADY_EXISTS &&
-                healDanglingLocalDiskReplica(key) ==
-                    DiskReplicaHealResult::kEvicted) {
-                start_result =
-                    master_client_.PutStart(key, slice_lengths, client_cfg);
-            }
-            if (!start_result) {
-                ErrorCode err = start_result.error();
-                if (err == ErrorCode::OBJECT_ALREADY_EXISTS) {
-                    VLOG(1) << "object_already_exists key=" << key;
-                    native_result = tl::expected<void, ErrorCode>{};
-                    break;
-                }
-                if (err == ErrorCode::NO_AVAILABLE_HANDLE) {
-                    LOG(WARNING)
-                        << "Failed to start put operation for key=" << key
-                        << PUT_NO_SPACE_HELPER_STR;
-                } else {
-                    LOG(ERROR)
-                        << "Failed to start put operation for key=" << key
-                        << ": " << toString(err);
-                }
-                native_result = tl::unexpected(err);
-                break;
-            }
+    auto finish_external = [&](tl::expected<void, ErrorCode> native_result) {
+        if (!external_store_backend_) return native_result;
+        external_task.reset();
+        CheckExternalResults(external_results, 1);
+        return MergeExternalPutResults({std::move(native_result)},
+                                       external_results)[0];
+    };
+    auto start_result = master_client_.PutStart(key, slice_lengths, client_cfg);
+    if (!start_result &&
+        start_result.error() == ErrorCode::OBJECT_ALREADY_EXISTS &&
+        healDanglingLocalDiskReplica(key) == DiskReplicaHealResult::kEvicted) {
+        start_result = master_client_.PutStart(key, slice_lengths, client_cfg);
+    }
+    if (!start_result) {
+        ErrorCode err = start_result.error();
+        if (err == ErrorCode::OBJECT_ALREADY_EXISTS) {
+            VLOG(1) << "object_already_exists key=" << key;
+            return finish_external(tl::expected<void, ErrorCode>{});
+        }
+        if (err == ErrorCode::NO_AVAILABLE_HANDLE) {
+            LOG(WARNING) << "Failed to start put operation for key=" << key
+                         << PUT_NO_SPACE_HELPER_STR;
+        } else {
+            LOG(ERROR) << "Failed to start put operation for key=" << key
+                       << ": " << toString(err);
+        }
+        return finish_external(tl::unexpected(err));
+    }
 
-            ReplicaTransferSummary transfer_summary;
-            for (const auto& replica : start_result.value()) {
-                transfer_summary.RecordAllocatedReplica(replica);
-            }
+    ReplicaTransferSummary transfer_summary;
+    for (const auto& replica : start_result.value()) {
+        transfer_summary.RecordAllocatedReplica(replica);
+    }
 
-            // Record Put transfer latency (all replicas)
-            auto t0_put = std::chrono::steady_clock::now();
+    // Record Put transfer latency (all replicas)
+    auto t0_put = std::chrono::steady_clock::now();
 
-            // We must deal with disk replica first, then the disk
-            // putrevoke/putend can be called surely
-            if (storage_backend_) {
-                for (auto it = start_result.value().rbegin();
-                     it != start_result.value().rend(); ++it) {
-                    const auto& replica = *it;
-                    if (replica.is_disk_replica()) {
-                        // Store to local file if storage backend is available
-                        auto disk_descriptor = replica.get_disk_descriptor();
-                        PutToLocalFile(key, slices, disk_descriptor);
-                        break;  // Only one disk replica is needed
-                    }
-                }
-            }
-
-            for (const auto& replica : start_result.value()) {
-                if (replica.is_memory_replica() || replica.is_nof_replica()) {
-                    // Transfer data using allocated handles from all replicas
-                    const auto replica_type = replica.is_memory_replica()
-                                                  ? ReplicaType::MEMORY
-                                                  : ReplicaType::NOF_SSD;
-                    ErrorCode transfer_err = TransferWrite(replica, slices);
-                    if (transfer_err != ErrorCode::OK) {
-                        transfer_summary.RecordFailure(replica_type,
-                                                       transfer_err);
-                        continue;
-                    }
-                    transfer_summary.RecordSuccess(replica_type);
-                }
-            }
-
-            if (transfer_summary.allocated_dfs_replicas > 0 &&
-                NonDfsTransfersSucceeded(transfer_summary)) {
-                std::vector<std::string> dfs_keys;
-                std::vector<const std::vector<Slice>*> dfs_slices;
-                std::vector<DistributedFSDescriptor> dfs_descriptors;
-                for (const auto& replica : start_result.value()) {
-                    if (!replica.is_dfs_replica()) {
-                        continue;
-                    }
-                    dfs_keys.push_back(key);
-                    dfs_slices.push_back(&slices);
-                    dfs_descriptors.push_back(replica.get_dfs_descriptor());
-                }
-                for (auto dfs_result :
-                     WriteDfsReplicas(dfs_keys, dfs_slices, dfs_descriptors)) {
-                    if (dfs_result == ErrorCode::OK) {
-                        transfer_summary.RecordSuccess(ReplicaType::DFS);
-                    } else {
-                        transfer_summary.RecordFailure(ReplicaType::DFS,
-                                                       dfs_result);
-                    }
-                }
-            } else if (transfer_summary.allocated_dfs_replicas > 0) {
-                // A DFS replica was allocated but is abandoned because a peer
-                // replica failed first. Without this counter the write simply
-                // disappears: no error is recorded against DFS and no I/O is
-                // attempted. Counted per key, matching SubmitDfsWrites.
-                VLOG(1) << "Skipping DFS write, action=skip, key=" << key
-                        << ", reason=non_dfs_transfer_failed";
-                if (auto* dfs_metric = GetDfsMetricPtr()) {
-                    dfs_metric->RecordSkippedWrites(1);
-                }
-            }
-
-            auto us_put = std::chrono::duration_cast<std::chrono::microseconds>(
-                              std::chrono::steady_clock::now() - t0_put)
-                              .count();
-            if (metrics_) {
-                metrics_->transfer_metric.put_latency_us.observe(us_put);
-            }
-
-            const auto finalize_decision =
-                DetermineFinalizeDecision(config, transfer_summary);
-
-            if (finalize_decision.end_type.has_value()) {
-                auto end_result =
-                    master_client_.PutEnd(ObjectMeta{key, object_checksum},
-                                          *finalize_decision.end_type);
-                if (!end_result) {
-                    ErrorCode err = end_result.error();
-                    LOG(ERROR) << "Failed to end put operation: " << err;
-                    native_result = tl::unexpected(err);
-                    break;
-                }
-            }
-
-            if (finalize_decision.revoke_type.has_value()) {
-                auto revoke_result = master_client_.PutRevoke(
-                    key, *finalize_decision.revoke_type);
-                if (!revoke_result) {
-                    LOG(ERROR) << "Failed to revoke put operation";
-                    native_result = tl::unexpected(revoke_result.error());
-                    break;
-                }
-            }
-
-            if (!finalize_decision.success) {
-                native_result = tl::unexpected(finalize_decision.error);
-                break;
-            }
-
-            native_result = tl::expected<void, ErrorCode>{};
-            break;
-        } while (false);
-    } catch (...) {
-        if (external_store_backend_ && external_task && *external_task) {
-            try {
-                external_store_backend_->Wait(*external_task,
-                                              external_wait_timeout_ms_);
-            } catch (...) {
-                std::terminate();
+    // We must deal with disk replica first, then the disk putrevoke/putend can
+    // be called surely
+    if (storage_backend_) {
+        for (auto it = start_result.value().rbegin();
+             it != start_result.value().rend(); ++it) {
+            const auto& replica = *it;
+            if (replica.is_disk_replica()) {
+                // Store to local file if storage backend is available
+                auto disk_descriptor = replica.get_disk_descriptor();
+                PutToLocalFile(key, slices, disk_descriptor);
+                break;  // Only one disk replica is needed
             }
         }
-        throw;
     }
-    if (!external_store_backend_) return native_result;
-    auto external_results =
-        external_task && *external_task
-            ? external_store_backend_->Wait(*external_task,
-                                            external_wait_timeout_ms_)
-            : std::vector<tl::expected<void, ErrorCode>>(
-                  1, tl::unexpected(external_task ? ErrorCode::INTERNAL_ERROR
-                                                  : external_task.error()));
-    external_detail::CheckResults(external_results, 1);
-    return external_detail::MergePutResults({std::move(native_result)},
-                                            external_results)[0];
+
+    for (const auto& replica : start_result.value()) {
+        if (replica.is_memory_replica() || replica.is_nof_replica()) {
+            // Transfer data using allocated handles from all replicas
+            const auto replica_type = replica.is_memory_replica()
+                                          ? ReplicaType::MEMORY
+                                          : ReplicaType::NOF_SSD;
+            ErrorCode transfer_err = TransferWrite(replica, slices);
+            if (transfer_err != ErrorCode::OK) {
+                transfer_summary.RecordFailure(replica_type, transfer_err);
+                continue;
+            }
+            transfer_summary.RecordSuccess(replica_type);
+        }
+    }
+
+    if (transfer_summary.allocated_dfs_replicas > 0 &&
+        NonDfsTransfersSucceeded(transfer_summary)) {
+        std::vector<std::string> dfs_keys;
+        std::vector<const std::vector<Slice>*> dfs_slices;
+        std::vector<DistributedFSDescriptor> dfs_descriptors;
+        for (const auto& replica : start_result.value()) {
+            if (!replica.is_dfs_replica()) {
+                continue;
+            }
+            dfs_keys.push_back(key);
+            dfs_slices.push_back(&slices);
+            dfs_descriptors.push_back(replica.get_dfs_descriptor());
+        }
+        for (auto dfs_result :
+             WriteDfsReplicas(dfs_keys, dfs_slices, dfs_descriptors)) {
+            if (dfs_result == ErrorCode::OK) {
+                transfer_summary.RecordSuccess(ReplicaType::DFS);
+            } else {
+                transfer_summary.RecordFailure(ReplicaType::DFS, dfs_result);
+            }
+        }
+    } else if (transfer_summary.allocated_dfs_replicas > 0) {
+        // A DFS replica was allocated but is abandoned because a peer replica
+        // failed first. Without this counter the write simply disappears: no
+        // error is recorded against DFS and no I/O is attempted. Counted per
+        // key, matching SubmitDfsWrites.
+        VLOG(1) << "Skipping DFS write, action=skip, key=" << key
+                << ", reason=non_dfs_transfer_failed";
+        if (auto* dfs_metric = GetDfsMetricPtr()) {
+            dfs_metric->RecordSkippedWrites(1);
+        }
+    }
+
+    auto us_put = std::chrono::duration_cast<std::chrono::microseconds>(
+                      std::chrono::steady_clock::now() - t0_put)
+                      .count();
+    if (metrics_) {
+        metrics_->transfer_metric.put_latency_us.observe(us_put);
+    }
+
+    const auto finalize_decision =
+        DetermineFinalizeDecision(config, transfer_summary);
+
+    if (finalize_decision.end_type.has_value()) {
+        auto end_result = master_client_.PutEnd(
+            ObjectMeta{key, object_checksum}, *finalize_decision.end_type);
+        if (!end_result) {
+            ErrorCode err = end_result.error();
+            LOG(ERROR) << "Failed to end put operation: " << err;
+            return finish_external(tl::unexpected(err));
+        }
+    }
+
+    if (finalize_decision.revoke_type.has_value()) {
+        auto revoke_result =
+            master_client_.PutRevoke(key, *finalize_decision.revoke_type);
+        if (!revoke_result) {
+            LOG(ERROR) << "Failed to revoke put operation";
+            return finish_external(tl::unexpected(revoke_result.error()));
+        }
+    }
+
+    if (!finalize_decision.success) {
+        return finish_external(tl::unexpected(finalize_decision.error));
+    }
+
+    return finish_external(tl::expected<void, ErrorCode>{});
 }
 
 namespace {
@@ -2239,11 +2286,10 @@ Client::DiskReplicaHealResult Client::healDanglingLocalDiskReplica(
 tl::expected<void, ErrorCode> Client::Upsert(const ObjectKey& key,
                                              std::vector<Slice>& slices,
                                              const ReplicateConfig& config) {
-    std::unique_lock<std::recursive_mutex> external_lock(external_store_mutex_,
-                                                         std::defer_lock);
+    std::unique_lock<std::mutex> external_lock(external_store_mutex_,
+                                               std::defer_lock);
     if (external_store_backend_) external_lock.lock();
-    if (external_store_backend_ &&
-        !external_detail::ValidWrite({key}, {slices})) {
+    if (external_store_backend_ && !ValidateExternalWrite({key}, {slices})) {
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
 
@@ -2273,170 +2319,156 @@ tl::expected<void, ErrorCode> Client::Upsert(const ObjectKey& key,
     }
 
     // Start upsert operation
-    tl::expected<void*, ErrorCode> external_task =
-        tl::unexpected(ErrorCode::INTERNAL_ERROR);
+    std::vector<tl::expected<void, ErrorCode>> external_results;
+    auto wait_external = [&](void* task) noexcept {
+        try {
+            external_results =
+                external_store_backend_->Wait(task, external_wait_timeout_ms_);
+        } catch (...) {
+            std::terminate();
+        }
+    };
+    // Drain an outstanding task even if the native path throws.
+    std::unique_ptr<void, decltype(wait_external)> external_task(nullptr,
+                                                                 wait_external);
     if (external_store_backend_) {
-        external_task = external_store_backend_->Put(tenant_id(), key, slices);
+        auto submitted = external_store_backend_->Put(tenant_id(), key, slices);
+        if (submitted && *submitted) {
+            external_task.reset(*submitted);
+        } else {
+            external_results.assign(
+                1, tl::unexpected(submitted ? ErrorCode::INTERNAL_ERROR
+                                            : submitted.error()));
+        }
     }
-    tl::expected<void, ErrorCode> native_result;
-    try {
-        do {
-            auto start_result =
-                master_client_.UpsertStart(key, slice_lengths, client_cfg);
-            if (!start_result) {
-                ErrorCode err = start_result.error();
-                if (err == ErrorCode::NO_AVAILABLE_HANDLE) {
-                    LOG(WARNING)
-                        << "Failed to start upsert operation for key=" << key
-                        << PUT_NO_SPACE_HELPER_STR;
-                } else {
-                    LOG(ERROR)
-                        << "Failed to start upsert operation for key=" << key
-                        << ": " << toString(err);
-                }
-                native_result = tl::unexpected(err);
+    auto finish_external = [&](tl::expected<void, ErrorCode> native_result) {
+        if (!external_store_backend_) return native_result;
+        external_task.reset();
+        CheckExternalResults(external_results, 1);
+        return MergeExternalPutResults({std::move(native_result)},
+                                       external_results)[0];
+    };
+    auto start_result =
+        master_client_.UpsertStart(key, slice_lengths, client_cfg);
+    if (!start_result) {
+        ErrorCode err = start_result.error();
+        if (err == ErrorCode::NO_AVAILABLE_HANDLE) {
+            LOG(WARNING) << "Failed to start upsert operation for key=" << key
+                         << PUT_NO_SPACE_HELPER_STR;
+        } else {
+            LOG(ERROR) << "Failed to start upsert operation for key=" << key
+                       << ": " << toString(err);
+        }
+        return finish_external(tl::unexpected(err));
+    }
+
+    ReplicaTransferSummary transfer_summary;
+    for (const auto& replica : start_result.value()) {
+        transfer_summary.RecordAllocatedReplica(replica);
+    }
+
+    // Record transfer latency
+    auto t0 = std::chrono::steady_clock::now();
+
+    // Handle disk replicas first
+    if (storage_backend_) {
+        for (auto it = start_result.value().rbegin();
+             it != start_result.value().rend(); ++it) {
+            const auto& replica = *it;
+            if (replica.is_disk_replica()) {
+                auto disk_descriptor = replica.get_disk_descriptor();
+                PutToLocalFile(key, slices, disk_descriptor);
                 break;
-            }
-
-            ReplicaTransferSummary transfer_summary;
-            for (const auto& replica : start_result.value()) {
-                transfer_summary.RecordAllocatedReplica(replica);
-            }
-
-            // Record transfer latency
-            auto t0 = std::chrono::steady_clock::now();
-
-            // Handle disk replicas first
-            if (storage_backend_) {
-                for (auto it = start_result.value().rbegin();
-                     it != start_result.value().rend(); ++it) {
-                    const auto& replica = *it;
-                    if (replica.is_disk_replica()) {
-                        auto disk_descriptor = replica.get_disk_descriptor();
-                        PutToLocalFile(key, slices, disk_descriptor);
-                        break;
-                    }
-                }
-            }
-
-            // Transfer to memory and NoF replicas first.
-            for (const auto& replica : start_result.value()) {
-                if (replica.is_memory_replica() || replica.is_nof_replica()) {
-                    const auto replica_type = replica.is_memory_replica()
-                                                  ? ReplicaType::MEMORY
-                                                  : ReplicaType::NOF_SSD;
-                    ErrorCode transfer_err = TransferWrite(replica, slices);
-                    if (transfer_err != ErrorCode::OK) {
-                        transfer_summary.RecordFailure(replica_type,
-                                                       transfer_err);
-                        continue;
-                    }
-                    transfer_summary.RecordSuccess(replica_type);
-                }
-            }
-
-            if (transfer_summary.allocated_dfs_replicas > 0 &&
-                NonDfsTransfersSucceeded(transfer_summary)) {
-                std::vector<std::string> dfs_keys;
-                std::vector<const std::vector<Slice>*> dfs_slices;
-                std::vector<DistributedFSDescriptor> dfs_descriptors;
-                for (const auto& replica : start_result.value()) {
-                    if (!replica.is_dfs_replica()) {
-                        continue;
-                    }
-                    dfs_keys.push_back(key);
-                    dfs_slices.push_back(&slices);
-                    dfs_descriptors.push_back(replica.get_dfs_descriptor());
-                }
-                for (auto dfs_result :
-                     WriteDfsReplicas(dfs_keys, dfs_slices, dfs_descriptors)) {
-                    if (dfs_result == ErrorCode::OK) {
-                        transfer_summary.RecordSuccess(ReplicaType::DFS);
-                    } else {
-                        transfer_summary.RecordFailure(ReplicaType::DFS,
-                                                       dfs_result);
-                    }
-                }
-            } else if (transfer_summary.allocated_dfs_replicas > 0) {
-                // Same abandoned-write case as in Put: the DFS replica was
-                // allocated but a peer replica failed first, so no I/O is
-                // attempted and no DFS error is recorded. Counted per key,
-                // matching SubmitDfsWrites.
-                VLOG(1) << "Skipping DFS write, action=skip, key=" << key
-                        << ", reason=non_dfs_transfer_failed";
-                if (auto* dfs_metric = GetDfsMetricPtr()) {
-                    dfs_metric->RecordSkippedWrites(1);
-                }
-            }
-
-            auto us = std::chrono::duration_cast<std::chrono::microseconds>(
-                          std::chrono::steady_clock::now() - t0)
-                          .count();
-            if (metrics_) {
-                metrics_->transfer_metric.put_latency_us.observe(us);
-            }
-
-            const auto finalize_decision =
-                DetermineFinalizeDecision(config, transfer_summary);
-            if (finalize_decision.end_type.has_value()) {
-                auto end_result =
-                    master_client_.UpsertEnd(ObjectMeta{key, object_checksum},
-                                             *finalize_decision.end_type);
-                if (!end_result) {
-                    ErrorCode err = end_result.error();
-                    LOG(ERROR) << "Failed to end upsert operation: " << err;
-                    native_result = tl::unexpected(err);
-                    break;
-                }
-            }
-            if (finalize_decision.revoke_type.has_value()) {
-                auto revoke_result = master_client_.UpsertRevoke(
-                    key, *finalize_decision.revoke_type);
-                if (!revoke_result) {
-                    LOG(ERROR) << "Failed to revoke upsert operation";
-                    native_result = tl::unexpected(revoke_result.error());
-                    break;
-                }
-            }
-            if (!finalize_decision.success) {
-                native_result = tl::unexpected(finalize_decision.error);
-                break;
-            }
-
-            // Success-side invalidation: a concurrent read between the
-            // pre-upsert RemoveHotKey() and UpsertEnd could have read the old
-            // value and submitted an async hot-cache fill with a still-valid
-            // token. Invalidate again now that the new value is committed so
-            // that stale fill cannot publish.
-            if (hot_cache_) {
-                hot_cache_->RemoveHotKey(key);
-            }
-
-            native_result = tl::expected<void, ErrorCode>{};
-            break;
-        } while (false);
-    } catch (...) {
-        if (external_store_backend_ && external_task && *external_task) {
-            try {
-                external_store_backend_->Wait(*external_task,
-                                              external_wait_timeout_ms_);
-            } catch (...) {
-                std::terminate();
             }
         }
-        throw;
     }
-    if (!external_store_backend_) return native_result;
-    auto external_results =
-        external_task && *external_task
-            ? external_store_backend_->Wait(*external_task,
-                                            external_wait_timeout_ms_)
-            : std::vector<tl::expected<void, ErrorCode>>(
-                  1, tl::unexpected(external_task ? ErrorCode::INTERNAL_ERROR
-                                                  : external_task.error()));
-    external_detail::CheckResults(external_results, 1);
-    return external_detail::MergePutResults({std::move(native_result)},
-                                            external_results)[0];
+
+    // Transfer to memory and NoF replicas first.
+    for (const auto& replica : start_result.value()) {
+        if (replica.is_memory_replica() || replica.is_nof_replica()) {
+            const auto replica_type = replica.is_memory_replica()
+                                          ? ReplicaType::MEMORY
+                                          : ReplicaType::NOF_SSD;
+            ErrorCode transfer_err = TransferWrite(replica, slices);
+            if (transfer_err != ErrorCode::OK) {
+                transfer_summary.RecordFailure(replica_type, transfer_err);
+                continue;
+            }
+            transfer_summary.RecordSuccess(replica_type);
+        }
+    }
+
+    if (transfer_summary.allocated_dfs_replicas > 0 &&
+        NonDfsTransfersSucceeded(transfer_summary)) {
+        std::vector<std::string> dfs_keys;
+        std::vector<const std::vector<Slice>*> dfs_slices;
+        std::vector<DistributedFSDescriptor> dfs_descriptors;
+        for (const auto& replica : start_result.value()) {
+            if (!replica.is_dfs_replica()) {
+                continue;
+            }
+            dfs_keys.push_back(key);
+            dfs_slices.push_back(&slices);
+            dfs_descriptors.push_back(replica.get_dfs_descriptor());
+        }
+        for (auto dfs_result :
+             WriteDfsReplicas(dfs_keys, dfs_slices, dfs_descriptors)) {
+            if (dfs_result == ErrorCode::OK) {
+                transfer_summary.RecordSuccess(ReplicaType::DFS);
+            } else {
+                transfer_summary.RecordFailure(ReplicaType::DFS, dfs_result);
+            }
+        }
+    } else if (transfer_summary.allocated_dfs_replicas > 0) {
+        // Same abandoned-write case as in Put: the DFS replica was allocated
+        // but a peer replica failed first, so no I/O is attempted and no DFS
+        // error is recorded. Counted per key, matching SubmitDfsWrites.
+        VLOG(1) << "Skipping DFS write, action=skip, key=" << key
+                << ", reason=non_dfs_transfer_failed";
+        if (auto* dfs_metric = GetDfsMetricPtr()) {
+            dfs_metric->RecordSkippedWrites(1);
+        }
+    }
+
+    auto us = std::chrono::duration_cast<std::chrono::microseconds>(
+                  std::chrono::steady_clock::now() - t0)
+                  .count();
+    if (metrics_) {
+        metrics_->transfer_metric.put_latency_us.observe(us);
+    }
+
+    const auto finalize_decision =
+        DetermineFinalizeDecision(config, transfer_summary);
+    if (finalize_decision.end_type.has_value()) {
+        auto end_result = master_client_.UpsertEnd(
+            ObjectMeta{key, object_checksum}, *finalize_decision.end_type);
+        if (!end_result) {
+            ErrorCode err = end_result.error();
+            LOG(ERROR) << "Failed to end upsert operation: " << err;
+            return finish_external(tl::unexpected(err));
+        }
+    }
+    if (finalize_decision.revoke_type.has_value()) {
+        auto revoke_result =
+            master_client_.UpsertRevoke(key, *finalize_decision.revoke_type);
+        if (!revoke_result) {
+            LOG(ERROR) << "Failed to revoke upsert operation";
+            return finish_external(tl::unexpected(revoke_result.error()));
+        }
+    }
+    if (!finalize_decision.success) {
+        return finish_external(tl::unexpected(finalize_decision.error));
+    }
+
+    // Success-side invalidation: a concurrent read between the pre-upsert
+    // RemoveHotKey() and UpsertEnd could have read the old value and submitted
+    // an async hot-cache fill with a still-valid token. Invalidate again now
+    // that the new value is committed so that stale fill cannot publish.
+    if (hot_cache_) {
+        hot_cache_->RemoveHotKey(key);
+    }
+
+    return finish_external(tl::expected<void, ErrorCode>{});
 }
 
 // TODO: `client.cpp` is too long, consider split it into multiple files
@@ -3695,11 +3727,11 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPut(
     const std::vector<ObjectKey>& keys,
     std::vector<std::vector<Slice>>& batched_slices,
     const ReplicateConfig& config, const WriteBufferStager& stager) {
-    std::unique_lock<std::recursive_mutex> external_lock(external_store_mutex_,
-                                                         std::defer_lock);
+    std::unique_lock<std::mutex> external_lock(external_store_mutex_,
+                                               std::defer_lock);
     if (external_store_backend_) external_lock.lock();
     if (external_store_backend_ &&
-        (stager || !external_detail::ValidWrite(keys, batched_slices))) {
+        (stager || !ValidateExternalWrite(keys, batched_slices))) {
         return std::vector<tl::expected<void, ErrorCode>>(
             keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
     }
@@ -3716,62 +3748,59 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPut(
                 keys.size(), tl::unexpected(*err));
         }
     }
-    tl::expected<void*, ErrorCode> external_task =
-        tl::unexpected(ErrorCode::INTERNAL_ERROR);
-    if (external_store_backend_) {
-        external_task = external_store_backend_->BatchPut(tenant_id(), keys,
-                                                          batched_slices);
-    }
-    std::vector<tl::expected<void, ErrorCode>> native_result;
-    try {
-        do {
-            if (client_cfg.prefer_alloc_in_same_node) {
-                StartBatchPut(ops, client_cfg);
-                StageWriteBuffersForRemoteReplicas(ops, stager);
-                native_result = BatchWriteWhenPreferSameNode(ops, false);
-                break;
-            }
-            StartBatchPut(ops, client_cfg);
-            StageWriteBuffersForRemoteReplicas(ops, stager);
-
-            auto t0 = std::chrono::steady_clock::now();
-            SubmitTransfers(ops);
-            WaitForTransfers(ops);
-            SubmitDfsWrites(ops);
-            auto us = std::chrono::duration_cast<std::chrono::microseconds>(
-                          std::chrono::steady_clock::now() - t0)
-                          .count();
-            if (metrics_) {
-                metrics_->transfer_metric.batch_put_latency_us.observe(us);
-            }
-
-            FinalizeBatchPut(ops);
-            native_result = CollectResults(ops);
-            break;
-        } while (false);
-    } catch (...) {
-        if (external_store_backend_ && external_task && *external_task) {
-            try {
-                external_store_backend_->Wait(*external_task,
-                                              external_wait_timeout_ms_);
-            } catch (...) {
-                std::terminate();
-            }
+    std::vector<tl::expected<void, ErrorCode>> external_results;
+    auto wait_external = [&](void* task) noexcept {
+        try {
+            external_results =
+                external_store_backend_->Wait(task, external_wait_timeout_ms_);
+        } catch (...) {
+            std::terminate();
         }
-        throw;
+    };
+    // Drain an outstanding task even if the native path throws.
+    std::unique_ptr<void, decltype(wait_external)> external_task(nullptr,
+                                                                 wait_external);
+    if (external_store_backend_) {
+        auto submitted = external_store_backend_->BatchPut(tenant_id(), keys,
+                                                           batched_slices);
+        if (submitted && *submitted) {
+            external_task.reset(*submitted);
+        } else {
+            external_results.assign(
+                keys.size(),
+                tl::unexpected(submitted ? ErrorCode::INTERNAL_ERROR
+                                         : submitted.error()));
+        }
     }
-    if (!external_store_backend_) return native_result;
-    auto external_results =
-        external_task && *external_task
-            ? external_store_backend_->Wait(*external_task,
-                                            external_wait_timeout_ms_)
-            : std::vector<tl::expected<void, ErrorCode>>(
-                  keys.size(),
-                  tl::unexpected(external_task ? ErrorCode::INTERNAL_ERROR
-                                               : external_task.error()));
-    external_detail::CheckResults(external_results, keys.size());
-    return external_detail::MergePutResults(std::move(native_result),
-                                            external_results);
+    auto finish_external =
+        [&](std::vector<tl::expected<void, ErrorCode>> native_result) {
+            if (!external_store_backend_) return native_result;
+            external_task.reset();
+            CheckExternalResults(external_results, keys.size());
+            return MergeExternalPutResults(std::move(native_result),
+                                           external_results);
+        };
+    if (client_cfg.prefer_alloc_in_same_node) {
+        StartBatchPut(ops, client_cfg);
+        StageWriteBuffersForRemoteReplicas(ops, stager);
+        return finish_external(BatchWriteWhenPreferSameNode(ops, false));
+    }
+    StartBatchPut(ops, client_cfg);
+    StageWriteBuffersForRemoteReplicas(ops, stager);
+
+    auto t0 = std::chrono::steady_clock::now();
+    SubmitTransfers(ops);
+    WaitForTransfers(ops);
+    SubmitDfsWrites(ops);
+    auto us = std::chrono::duration_cast<std::chrono::microseconds>(
+                  std::chrono::steady_clock::now() - t0)
+                  .count();
+    if (metrics_) {
+        metrics_->transfer_metric.batch_put_latency_us.observe(us);
+    }
+
+    FinalizeBatchPut(ops);
+    return finish_external(CollectResults(ops));
 }
 
 // Defined after PutOperation: std::vector<PutOperation> must be instantiated
@@ -3787,11 +3816,11 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchUpsert(
     const std::vector<ObjectKey>& keys,
     std::vector<std::vector<Slice>>& batched_slices,
     const ReplicateConfig& config, const WriteBufferStager& stager) {
-    std::unique_lock<std::recursive_mutex> external_lock(external_store_mutex_,
-                                                         std::defer_lock);
+    std::unique_lock<std::mutex> external_lock(external_store_mutex_,
+                                               std::defer_lock);
     if (external_store_backend_) external_lock.lock();
     if (external_store_backend_ &&
-        (stager || !external_detail::ValidWrite(keys, batched_slices))) {
+        (stager || !ValidateExternalWrite(keys, batched_slices))) {
         return std::vector<tl::expected<void, ErrorCode>>(
             keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
     }
@@ -3808,62 +3837,59 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchUpsert(
                 keys.size(), tl::unexpected(*err));
         }
     }
-    tl::expected<void*, ErrorCode> external_task =
-        tl::unexpected(ErrorCode::INTERNAL_ERROR);
-    if (external_store_backend_) {
-        external_task = external_store_backend_->BatchPut(tenant_id(), keys,
-                                                          batched_slices);
-    }
-    std::vector<tl::expected<void, ErrorCode>> native_result;
-    try {
-        do {
-            if (client_cfg.prefer_alloc_in_same_node) {
-                StartBatchUpsert(ops, client_cfg);
-                StageWriteBuffersForRemoteReplicas(ops, stager);
-                native_result = BatchWriteWhenPreferSameNode(ops, true);
-                break;
-            }
-
-            StartBatchUpsert(ops, client_cfg);
-            StageWriteBuffersForRemoteReplicas(ops, stager);
-            auto t0 = std::chrono::steady_clock::now();
-            SubmitTransfers(ops);
-            WaitForTransfers(ops);
-            SubmitDfsWrites(ops);
-            auto us = std::chrono::duration_cast<std::chrono::microseconds>(
-                          std::chrono::steady_clock::now() - t0)
-                          .count();
-            if (metrics_) {
-                metrics_->transfer_metric.batch_put_latency_us.observe(us);
-            }
-
-            FinalizeBatchUpsert(ops);
-            native_result = CollectResults(ops);
-            break;
-        } while (false);
-    } catch (...) {
-        if (external_store_backend_ && external_task && *external_task) {
-            try {
-                external_store_backend_->Wait(*external_task,
-                                              external_wait_timeout_ms_);
-            } catch (...) {
-                std::terminate();
-            }
+    std::vector<tl::expected<void, ErrorCode>> external_results;
+    auto wait_external = [&](void* task) noexcept {
+        try {
+            external_results =
+                external_store_backend_->Wait(task, external_wait_timeout_ms_);
+        } catch (...) {
+            std::terminate();
         }
-        throw;
+    };
+    // Drain an outstanding task even if the native path throws.
+    std::unique_ptr<void, decltype(wait_external)> external_task(nullptr,
+                                                                 wait_external);
+    if (external_store_backend_) {
+        auto submitted = external_store_backend_->BatchPut(tenant_id(), keys,
+                                                           batched_slices);
+        if (submitted && *submitted) {
+            external_task.reset(*submitted);
+        } else {
+            external_results.assign(
+                keys.size(),
+                tl::unexpected(submitted ? ErrorCode::INTERNAL_ERROR
+                                         : submitted.error()));
+        }
     }
-    if (!external_store_backend_) return native_result;
-    auto external_results =
-        external_task && *external_task
-            ? external_store_backend_->Wait(*external_task,
-                                            external_wait_timeout_ms_)
-            : std::vector<tl::expected<void, ErrorCode>>(
-                  keys.size(),
-                  tl::unexpected(external_task ? ErrorCode::INTERNAL_ERROR
-                                               : external_task.error()));
-    external_detail::CheckResults(external_results, keys.size());
-    return external_detail::MergePutResults(std::move(native_result),
-                                            external_results);
+    auto finish_external =
+        [&](std::vector<tl::expected<void, ErrorCode>> native_result) {
+            if (!external_store_backend_) return native_result;
+            external_task.reset();
+            CheckExternalResults(external_results, keys.size());
+            return MergeExternalPutResults(std::move(native_result),
+                                           external_results);
+        };
+    if (client_cfg.prefer_alloc_in_same_node) {
+        StartBatchUpsert(ops, client_cfg);
+        StageWriteBuffersForRemoteReplicas(ops, stager);
+        return finish_external(BatchWriteWhenPreferSameNode(ops, true));
+    }
+
+    StartBatchUpsert(ops, client_cfg);
+    StageWriteBuffersForRemoteReplicas(ops, stager);
+    auto t0 = std::chrono::steady_clock::now();
+    SubmitTransfers(ops);
+    WaitForTransfers(ops);
+    SubmitDfsWrites(ops);
+    auto us = std::chrono::duration_cast<std::chrono::microseconds>(
+                  std::chrono::steady_clock::now() - t0)
+                  .count();
+    if (metrics_) {
+        metrics_->transfer_metric.batch_put_latency_us.observe(us);
+    }
+
+    FinalizeBatchUpsert(ops);
+    return finish_external(CollectResults(ops));
 }
 
 std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
@@ -3916,58 +3942,54 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPutRevoke(
 }
 
 tl::expected<void, ErrorCode> Client::Remove(const ObjectKey& key, bool force) {
-    std::unique_lock<std::recursive_mutex> external_lock(external_store_mutex_,
-                                                         std::defer_lock);
+    std::unique_lock<std::mutex> external_lock(external_store_mutex_,
+                                               std::defer_lock);
     if (external_store_backend_) external_lock.lock();
 
     if (hot_cache_) {
         hot_cache_->BumpKeyGeneration(key);
     }
 
-    tl::expected<void*, ErrorCode> external_task =
-        tl::unexpected(ErrorCode::INTERNAL_ERROR);
-    if (external_store_backend_) {
-        external_task = external_store_backend_->Remove(tenant_id(), key);
-    }
-    tl::expected<void, ErrorCode> native_result;
-    try {
-        do {
-            auto result = master_client_.Remove(key, force);
-            // if (storage_backend_) {
-            //     storage_backend_->RemoveFile(key);
-            // }
-            if (!result) {
-                native_result = tl::unexpected(result.error());
-                break;
-            }
-            if (hot_cache_) {
-                hot_cache_->RemoveHotKey(key);
-            }
-
-            native_result = tl::expected<void, ErrorCode>{};
-            break;
-        } while (false);
-    } catch (...) {
-        if (external_store_backend_ && external_task && *external_task) {
-            try {
-                external_store_backend_->Wait(*external_task,
-                                              external_wait_timeout_ms_);
-            } catch (...) {
-                std::terminate();
-            }
+    std::vector<tl::expected<void, ErrorCode>> external_results;
+    auto wait_external = [&](void* task) noexcept {
+        try {
+            external_results =
+                external_store_backend_->Wait(task, external_wait_timeout_ms_);
+        } catch (...) {
+            std::terminate();
         }
-        throw;
+    };
+    // Drain an outstanding task even if the native path throws.
+    std::unique_ptr<void, decltype(wait_external)> external_task(nullptr,
+                                                                 wait_external);
+    if (external_store_backend_) {
+        auto submitted = external_store_backend_->Remove(tenant_id(), key);
+        if (submitted && *submitted) {
+            external_task.reset(*submitted);
+        } else {
+            external_results.assign(
+                1, tl::unexpected(submitted ? ErrorCode::INTERNAL_ERROR
+                                            : submitted.error()));
+        }
     }
-    if (!external_store_backend_) return native_result;
-    auto external_results =
-        external_task && *external_task
-            ? external_store_backend_->Wait(*external_task,
-                                            external_wait_timeout_ms_)
-            : std::vector<tl::expected<void, ErrorCode>>(
-                  1, tl::unexpected(external_task ? ErrorCode::INTERNAL_ERROR
-                                                  : external_task.error()));
-    external_detail::CheckResults(external_results, 1);
-    return native_result;
+    auto finish_external = [&](tl::expected<void, ErrorCode> native_result) {
+        if (!external_store_backend_) return native_result;
+        external_task.reset();
+        CheckExternalResults(external_results, 1);
+        return native_result;
+    };
+    auto result = master_client_.Remove(key, force);
+    // if (storage_backend_) {
+    //     storage_backend_->RemoveFile(key);
+    // }
+    if (!result) {
+        return finish_external(tl::unexpected(result.error()));
+    }
+    if (hot_cache_) {
+        hot_cache_->RemoveHotKey(key);
+    }
+
+    return finish_external(tl::expected<void, ErrorCode>{});
 }
 
 tl::expected<long, ErrorCode> Client::RemoveByRegex(const ObjectKey& str,
@@ -4015,62 +4037,61 @@ tl::expected<long, ErrorCode> Client::RemoveAll(bool force) {
 
 std::vector<tl::expected<void, ErrorCode>> Client::BatchRemove(
     const std::vector<ObjectKey>& keys, bool force) {
-    std::unique_lock<std::recursive_mutex> external_lock(external_store_mutex_,
-                                                         std::defer_lock);
+    std::unique_lock<std::mutex> external_lock(external_store_mutex_,
+                                               std::defer_lock);
     if (external_store_backend_) external_lock.lock();
 
     if (hot_cache_) {
         hot_cache_->BumpKeyGenerations(keys);
     }
 
-    tl::expected<void*, ErrorCode> external_task =
-        tl::unexpected(ErrorCode::INTERNAL_ERROR);
+    std::vector<tl::expected<void, ErrorCode>> external_results;
+    auto wait_external = [&](void* task) noexcept {
+        try {
+            external_results =
+                external_store_backend_->Wait(task, external_wait_timeout_ms_);
+        } catch (...) {
+            std::terminate();
+        }
+    };
+    // Drain an outstanding task even if the native path throws.
+    std::unique_ptr<void, decltype(wait_external)> external_task(nullptr,
+                                                                 wait_external);
     if (external_store_backend_) {
-        external_task = external_store_backend_->BatchRemove(tenant_id(), keys);
+        auto submitted =
+            external_store_backend_->BatchRemove(tenant_id(), keys);
+        if (submitted && *submitted) {
+            external_task.reset(*submitted);
+        } else {
+            external_results.assign(
+                keys.size(),
+                tl::unexpected(submitted ? ErrorCode::INTERNAL_ERROR
+                                         : submitted.error()));
+        }
     }
-    std::vector<tl::expected<void, ErrorCode>> native_result;
-    try {
-        do {
-            auto results = master_client_.BatchRemove(keys, force);
+    auto finish_external =
+        [&](std::vector<tl::expected<void, ErrorCode>> native_result) {
+            if (!external_store_backend_) return native_result;
+            external_task.reset();
+            CheckExternalResults(external_results, keys.size());
+            return native_result;
+        };
+    auto results = master_client_.BatchRemove(keys, force);
 
-            if (hot_cache_) {
-                std::vector<std::string> removed_keys;
-                removed_keys.reserve(std::min(keys.size(), results.size()));
-                for (size_t i = 0; i < keys.size(); ++i) {
-                    if (i < results.size() && results[i].has_value()) {
-                        removed_keys.emplace_back(keys[i]);
-                    }
-                }
-                if (!removed_keys.empty()) {
-                    hot_cache_->RemoveHotKeys(removed_keys);
-                }
-            }
-
-            native_result = results;
-            break;
-        } while (false);
-    } catch (...) {
-        if (external_store_backend_ && external_task && *external_task) {
-            try {
-                external_store_backend_->Wait(*external_task,
-                                              external_wait_timeout_ms_);
-            } catch (...) {
-                std::terminate();
+    if (hot_cache_) {
+        std::vector<std::string> removed_keys;
+        removed_keys.reserve(std::min(keys.size(), results.size()));
+        for (size_t i = 0; i < keys.size(); ++i) {
+            if (i < results.size() && results[i].has_value()) {
+                removed_keys.emplace_back(keys[i]);
             }
         }
-        throw;
+        if (!removed_keys.empty()) {
+            hot_cache_->RemoveHotKeys(removed_keys);
+        }
     }
-    if (!external_store_backend_) return native_result;
-    auto external_results =
-        external_task && *external_task
-            ? external_store_backend_->Wait(*external_task,
-                                            external_wait_timeout_ms_)
-            : std::vector<tl::expected<void, ErrorCode>>(
-                  keys.size(),
-                  tl::unexpected(external_task ? ErrorCode::INTERNAL_ERROR
-                                               : external_task.error()));
-    external_detail::CheckResults(external_results, keys.size());
-    return native_result;
+
+    return finish_external(results);
 }
 
 tl::expected<void, ErrorCode> Client::EvictDiskReplica(

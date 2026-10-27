@@ -1,8 +1,6 @@
 #include "kvclient_backend.h"
 
 #include <algorithm>
-#include <cstring>
-#include <limits>
 #include <map>
 #include <mutex>
 #include <stdexcept>
@@ -11,6 +9,7 @@
 #include <xxhash.h>
 
 #include "kv_client.h"
+#include "tenant_id.h"
 
 namespace mooncake {
 namespace {
@@ -65,7 +64,6 @@ struct KVClientBackend::Impl {
     };
 
     std::shared_ptr<kv::KvClient> sdk;
-    Quiesce quiesce;
     std::mutex mutex;
     bool disabled = false;
     std::map<uintptr_t, std::shared_ptr<Region>> registered;
@@ -77,8 +75,7 @@ struct KVClientBackend::Impl {
     tl::expected<kv::CacheKey, ErrorCode> Key(const std::string& tenant,
                                               const std::string& key) {
         if (key.empty()) return tl::unexpected(ErrorCode::INVALID_KEY);
-        const auto identity =
-            std::to_string(tenant.size()) + ":" + tenant + key;
+        const auto identity = TenantId(tenant).MakeScopedKey(key);
         const auto digest = XXH3_64bits(identity.data(), identity.size());
         kv::CacheKey result;
         for (size_t i = 0; i < result.size(); ++i) {
@@ -95,7 +92,7 @@ struct KVClientBackend::Impl {
         disabled = true;
         bool stopped = false;
         try {
-            stopped = quiesce();
+            stopped = sdk->Shutdown().ok();
         } catch (...) {
             stopped = false;
         }
@@ -166,13 +163,13 @@ struct KVClientBackend::Impl {
             entries.push_back(entry);
             task->indices.push_back(i);
             task->regions.push_back(region);
-            ++region->inflight;
         }
         // Publish ownership before SDK submission: allocation of the task map
         // must not fail after the SDK has started reading caller memory.
         void* token = &task->id;
         auto inserted = tasks.emplace(token, std::move(task)).first;
         auto& submitted = *inserted->second;
+        for (auto& region : submitted.regions) ++region->inflight;
         if (!submitted.indices.empty()) {
             kv::Status status;
             try {
@@ -202,13 +199,10 @@ struct KVClientBackend::Impl {
     }
 };
 
-KVClientBackend::KVClientBackend(std::shared_ptr<kv::KvClient> sdk,
-                                 Quiesce quiesce)
+KVClientBackend::KVClientBackend(std::shared_ptr<kv::KvClient> sdk)
     : impl_(std::make_unique<Impl>()) {
-    if (!sdk || !quiesce)
-        throw std::invalid_argument("SDK and quiesce required");
+    if (!sdk) throw std::invalid_argument("KVClient SDK is required");
     impl_->sdk = std::move(sdk);
-    impl_->quiesce = std::move(quiesce);
 }
 
 KVClientBackend::~KVClientBackend() {
@@ -252,6 +246,7 @@ std::vector<tl::expected<void, ErrorCode>> KVClientBackend::Wait(
             impl_->disabled
                 ? kv::Status::Error(kv::StatusCode::CANCELED, "SDK stopped")
                 : impl_->sdk->Wait(task.id, timeout_ms, result);
+        if (status.ok() && !result.status.ok()) status = result.status;
         // The SDK's timeout removes the task record before its asynchronous
         // channel drain finishes. Close all SDK channels before releasing MRs.
         if (!status.ok() && !task.remove && !impl_->disabled)

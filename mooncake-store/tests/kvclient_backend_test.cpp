@@ -1,18 +1,16 @@
 #include "kvclient_backend.h"
 #include "kv_client.h"
 
-#include <iostream>
-#include <stdexcept>
+#include <gtest/gtest.h>
 
-using namespace mooncake;
-static void Require(bool ok) {
-    if (!ok) throw std::runtime_error("KVClient backend assertion failed");
-}
-
+namespace mooncake {
+namespace {
 class FakeSdk final : public kv::KvClient {
    public:
     int registers = 0, stores = 0, waits = 0, deletes = 0, stops = 0;
     bool reject = false, timeout = false;
+    kv::Status task_status;
+    std::vector<kv::Status> completion;
     std::vector<kv::KVBuffer> entries;
     std::vector<kv::CacheKey> removed;
     kv::Status Init(const kv::KvClientConfig&) override { return {}; }
@@ -58,6 +56,8 @@ class FakeSdk final : public kv::KvClient {
                            kv::TaskId& id) override {
         ++deletes;
         removed = keys;
+        if (reject)
+            return kv::Status::Error(kv::StatusCode::RESOURCE_BUSY, "busy");
         id = 8;
         return {};
     }
@@ -66,8 +66,12 @@ class FakeSdk final : public kv::KvClient {
         ++waits;
         if (timeout)
             return kv::Status::Error(kv::StatusCode::TIMEOUT, "timeout");
-        result.entryStatus.assign(id == 8 ? removed.size() : entries.size(),
-                                  kv::Status::OK());
+        result.status = task_status;
+        if (!completion.empty())
+            result.entryStatus = completion;
+        else
+            result.entryStatus.assign(id == 8 ? removed.size() : entries.size(),
+                                      kv::Status::OK());
         return {};
     }
     kv::Status RegisterRegions(
@@ -82,59 +86,78 @@ class FakeSdk final : public kv::KvClient {
     }
 };
 
-int main() {
+TEST(KVClientBackendTest, DeletePreservesInputOrderAndTenantIsolation) {
     auto sdk = std::make_shared<FakeSdk>();
-    int barriers = 0;
-    auto barrier = [&] {
-        ++barriers;
-        return sdk->Shutdown().ok();
-    };
-    alignas(512) char data[2048]{};
-    KVClientBackend backend(sdk, barrier);
-    std::vector<std::shared_ptr<const StorageBuffer>> regions;
-    Require(bool(backend.RegisterRegions({{data, sizeof(data), "host", -1, {}}},
-                                         regions)));
-    auto pending = backend.BatchPut("tenant-a", {"A", "B", "C"},
-                                    {{{data + 512, 512}},
-                                     {{data, 512}, {data + 512, 512}},
-                                     {{data + 1024, 512}}});
-    Require(bool(pending));
-    Require(sdk->stores == 1 && sdk->entries.size() == 2);
-    Require(sdk->entries[0].offset == 0 && sdk->entries[0].buffer.handle == 42);
-    Require(sdk->entries[0].buffer.region.addr ==
-            reinterpret_cast<uintptr_t>(data + 512));
-    Require(!sdk->entries[0].mrKey.has_value());
-    Require(
-        !backend.UnregisterRegions(regions));  // Inflight MR cannot be revoked.
-    auto result = backend.Wait(*pending, 100);
-    Require(result.size() == 3 && result[0] && !result[1] && result[2]);
-    const auto stored_key = sdk->entries[0].key;
-    pending = backend.Remove("tenant-a", "A");
-    Require(bool(pending) && sdk->removed[0] == stored_key);
-    Require(bool(backend.Wait(*pending, 100)[0]));
-    Require(sdk->registers == 1);  // No registration in Put.
+    KVClientBackend backend(sdk);
+    sdk->completion = {kv::Status::OK(),
+                       kv::Status::Error(kv::StatusCode::NOT_FOUND, "missing")};
+    auto task = backend.BatchRemove("tenant-a", {"A", "", "B"});
+    ASSERT_TRUE(task);
+    ASSERT_EQ(sdk->removed.size(), 2);
+    const auto first_key = sdk->removed[0];
+    auto results = backend.Wait(*task, 100);
+    ASSERT_EQ(results.size(), 3);
+    EXPECT_TRUE(results[0]);
+    ASSERT_FALSE(results[1]);
+    EXPECT_EQ(results[1].error(), ErrorCode::INVALID_KEY);
+    ASSERT_FALSE(results[2]);
+    EXPECT_EQ(results[2].error(), ErrorCode::OBJECT_NOT_FOUND);
 
-    pending = backend.Put("tenant-a", "outside", {{data + 1900, 512}});
-    Require(bool(pending) && !backend.Wait(*pending, 100)[0]);
-    Require(sdk->stores ==
-            1);  // Reject an out-of-bounds range before SDK submission.
-    Require(bool(backend.UnregisterRegions(regions)));
-    pending = backend.Put("tenant-a", "unregistered", {{data, 512}});
-    Require(bool(pending) && !backend.Wait(*pending, 100)[0]);
-
-    Require(bool(backend.RegisterRegions({{data, sizeof(data), "host", -1, {}}},
-                                         regions)));
-    sdk->reject = true;
-    pending = backend.Put("tenant-a", "busy", {{data, 512}});
-    Require(bool(pending) && !backend.Wait(*pending, 100)[0]);
-    Require(sdk->waits ==
-            2);  // Submission failure did not invent a task to wait on.
-    sdk->reject = false;
-    sdk->timeout = true;
-    pending = backend.Put("tenant-a", "timeout", {{data, 512}});
-    Require(bool(pending) && !backend.Wait(*pending, 1)[0]);
-    Require(barriers == 1 && sdk->stops == 1);
-    Require(!backend.Put("tenant-a", "after-stop", {{data, 512}}));
-    Require(bool(backend.UnregisterRegions(regions)));
-    std::cout << "KVClient backend tests passed\n";
+    sdk->completion.clear();
+    task = backend.Remove("tenant-a", "A");
+    ASSERT_TRUE(task);
+    EXPECT_EQ(sdk->removed[0], first_key);
+    EXPECT_TRUE(backend.Wait(*task, 100)[0]);
+    task = backend.Remove("tenant-b", "A");
+    ASSERT_TRUE(task);
+    EXPECT_NE(sdk->removed[0], first_key);
+    EXPECT_TRUE(backend.Wait(*task, 100)[0]);
+    EXPECT_EQ(backend.Wait(*task, 100)[0].error(), ErrorCode::INVALID_PARAMS);
 }
+
+TEST(KVClientBackendTest, RejectedSubmissionDoesNotWaitOnInvalidTaskId) {
+    auto sdk = std::make_shared<FakeSdk>();
+    KVClientBackend backend(sdk);
+    sdk->reject = true;
+    auto task = backend.Remove("tenant-a", "A");
+    ASSERT_TRUE(task);
+    EXPECT_FALSE(backend.Wait(*task, 100)[0]);
+    EXPECT_EQ(sdk->waits, 0);
+}
+
+TEST(KVClientBackendTest, UnregisteredWritesNeverRegisterOrAccessPayload) {
+    auto sdk = std::make_shared<FakeSdk>();
+    KVClientBackend backend(sdk);
+    alignas(512) char data[1024]{};
+    auto task =
+        backend.BatchPut("tenant-a", {"A", "B"},
+                         {{{data, 512}}, {{data, 512}, {data + 512, 512}}});
+    ASSERT_TRUE(task);
+    auto results = backend.Wait(*task, 100);
+    ASSERT_EQ(results.size(), 2);
+    EXPECT_FALSE(results[0]);
+    EXPECT_FALSE(results[1]);
+    EXPECT_EQ(sdk->registers, 0);
+    EXPECT_EQ(sdk->stores, 0);
+    EXPECT_FALSE(backend.BatchPut("tenant-a", {"A"}, {}));
+}
+
+TEST(KVClientBackendTest, WaitAndTaskErrorsCannotBecomeSuccessfulEntries) {
+    auto sdk = std::make_shared<FakeSdk>();
+    {
+        KVClientBackend backend(sdk);
+        sdk->timeout = true;
+        auto task = backend.Remove("tenant-a", "A");
+        ASSERT_TRUE(task);
+        EXPECT_EQ(backend.Wait(*task, 1)[0].error(), ErrorCode::RPC_TIMEOUT);
+        sdk->timeout = false;
+        sdk->task_status =
+            kv::Status::Error(kv::StatusCode::TIMEOUT, "timeout");
+        task = backend.Remove("tenant-a", "A");
+        ASSERT_TRUE(task);
+        EXPECT_EQ(backend.Wait(*task, 1)[0].error(), ErrorCode::RPC_TIMEOUT);
+    }
+    EXPECT_EQ(sdk->stops, 1);
+}
+}  // namespace
+}  // namespace mooncake

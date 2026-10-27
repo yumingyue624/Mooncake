@@ -1,17 +1,5 @@
 set(MOONCAKE_STORE_TESTS_SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR})
 
-add_executable(external_store_operation_test external_store_operation_test.cpp)
-target_link_libraries(external_store_operation_test PRIVATE mooncake_store)
-add_test(NAME external_store_operation_test
-         COMMAND external_store_operation_test)
-if(MOONCAKE_WITH_KVCLIENT)
-  add_executable(kvclient_backend_test kvclient_backend_test.cpp)
-  target_include_directories(kvclient_backend_test
-                             PRIVATE ${KVCLIENT_INCLUDE_DIR})
-  target_link_libraries(kvclient_backend_test PRIVATE mooncake_store)
-  add_test(NAME kvclient_backend_test COMMAND kvclient_backend_test)
-endif()
-
 function(add_store_test name)
   add_executable(${name} ${ARGN})
   target_include_directories(${name} PRIVATE ${MOONCAKE_STORE_TESTS_SOURCE_DIR})
@@ -48,6 +36,12 @@ function(add_ha_test name)
            pthread)
   add_test(NAME ${name} COMMAND ${name})
 endfunction()
+
+if(MOONCAKE_WITH_KVCLIENT)
+  add_store_test(kvclient_backend_test kvclient_backend_test.cpp)
+  target_include_directories(kvclient_backend_test
+                             PRIVATE ${KVCLIENT_INCLUDE_DIR})
+endif()
 
 add_store_test(buffer_allocator_test buffer_allocator_test.cpp)
 add_store_test(weight_management_contract_test

@@ -104,9 +104,7 @@ set(MOONCAKE_STORE_CLIENT_SOURCES
     config/mmap_arena_config.cpp
     common/mmap_buffer.cpp
     client_service.cpp
-    client_external_storage.cpp
     external_store_backend.cpp
-    external_store_operation.cpp
     client_metric.cpp
     master_client.cpp
     storage_backend.cpp

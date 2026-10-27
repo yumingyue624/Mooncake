@@ -1,6 +1,5 @@
 #pragma once
 
-#include <functional>
 #include <memory>
 
 #include "external_store_backend.h"
@@ -12,12 +11,11 @@ class KvClient;
 namespace mooncake {
 
 // Built only with MOONCAKE_WITH_KVCLIENT. The SDK remains outside the public
-// ExternalStoreBackend interface. Quiesce must synchronously stop all SDK DMA;
+// ExternalStoreBackend interface. SDK shutdown must stop all source access;
 // a failed barrier is fatal rather than returning an unsafe caller buffer.
 class KVClientBackend final : public ExternalStoreBackend {
    public:
-    using Quiesce = std::function<bool()>;
-    KVClientBackend(std::shared_ptr<kv::KvClient> sdk, Quiesce quiesce);
+    explicit KVClientBackend(std::shared_ptr<kv::KvClient> sdk);
     ~KVClientBackend() override;
     tl::expected<void*, ErrorCode> Put(
         const std::string& tenant, const ObjectKey& key,

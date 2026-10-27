@@ -41,8 +41,7 @@ CreateExternalStoreBackend(const std::string& path, uint64_t& wait_timeout_ms) {
         // A task timeout is not a DMA barrier. Conservatively close the whole
         // SDK rather than relying on the asynchronous maxErrorCount drain.
         return std::shared_ptr<ExternalStoreBackend>(
-            std::make_shared<KVClientBackend>(
-                sdk, [sdk] { return sdk->Shutdown().ok(); }));
+            std::make_shared<KVClientBackend>(std::move(sdk)));
     }
 #endif
     LOG(ERROR) << "External store backend unavailable: " << name;
