@@ -2971,22 +2971,6 @@ PYBIND11_MODULE(_store, m) {
             },
             py::arg("buffer_ptr"), py::arg("size"),
             "Register a memory buffer for direct access operations")
-        .def("external_store_enabled",
-             [](MooncakeStorePyWrapper &self) {
-                 auto real = std::dynamic_pointer_cast<RealClient>(self.store_);
-                 return real && real->external_store_enabled();
-             })
-        .def(
-            "register_external_buffer",
-            [](MooncakeStorePyWrapper &self, uintptr_t ptr, size_t size) {
-                auto real = std::dynamic_pointer_cast<RealClient>(self.store_);
-                if (!real) return static_cast<int>(ErrorCode::INVALID_PARAMS);
-                py::gil_scoped_release release;
-                return real->register_external_buffer(
-                    reinterpret_cast<void *>(ptr), size);
-            },
-            py::arg("buffer_ptr"), py::arg("size"),
-            "Register an existing RealClient VA with the external backend only")
         .def(
             "unregister_buffer",
             [](MooncakeStorePyWrapper &self, uintptr_t buffer_ptr) {

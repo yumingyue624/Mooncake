@@ -17,7 +17,8 @@ void CheckResults(Results& results, size_t count) {
 
 Results MergePutResults(Results native, const Results& external) {
     if (native.size() != external.size()) {
-        native = Results(external.size(), tl::unexpected(ErrorCode::INTERNAL_ERROR));
+        native =
+            Results(external.size(), tl::unexpected(ErrorCode::INTERNAL_ERROR));
     }
     for (size_t i = 0; i < external.size(); ++i) {
         if (external[i]) native[i] = {};

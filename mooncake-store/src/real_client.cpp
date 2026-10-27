@@ -4516,11 +4516,6 @@ int RealClient::register_buffer(void *buffer, size_t size) {
     return to_py_ret(register_buffer_internal(buffer, size));
 }
 
-int RealClient::register_external_buffer(void *buffer, size_t size) {
-    if (!client_) return static_cast<int>(ErrorCode::INVALID_PARAMS);
-    return to_py_ret(client_->RegisterExternalMemory(buffer, size));
-}
-
 tl::expected<void, ErrorCode> RealClient::unregister_buffer_internal(
     void *buffer) {
     if (!client_) {

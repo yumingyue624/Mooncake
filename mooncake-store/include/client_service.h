@@ -92,8 +92,6 @@ class Client {
     bool HasExternalStoreBackend() const {
         return bool(external_store_backend_);
     }
-    tl::expected<void, ErrorCode> RegisterExternalMemory(void* addr,
-                                                         size_t size);
 
     /**
      * @brief Creates and initializes a new Client instance
@@ -885,11 +883,9 @@ class Client {
     tl::expected<void, ErrorCode> InitExternalStoreBackend();
     std::shared_ptr<ExternalStoreBackend> external_store_backend_;
     uint64_t external_wait_timeout_ms_ = 30000;
-    // A first implementation serializes this client's writes, deletes and MR
-    // lifecycle. It does not impose ordering across different clients.
+    // A first implementation serializes this client's writes and deletes.
+    // It does not impose ordering across different clients.
     std::recursive_mutex external_store_mutex_;
-    std::unordered_map<void*, std::shared_ptr<const StorageBuffer>>
-        external_regions_;
     /**
      * @brief Internal helper functions for initialization and data transfer
      */

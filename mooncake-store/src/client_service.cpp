@@ -16,6 +16,7 @@
 #include <cstdint>
 #include <cstring>
 #include <cstdlib>
+#include <exception>
 #include <iomanip>
 #include <limits>
 #ifdef USE_NOF
@@ -2010,25 +2011,30 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
     tl::expected<void, ErrorCode> native_result;
     try {
         do {
-            auto start_result = master_client_.PutStart(key, slice_lengths, client_cfg);
+            auto start_result =
+                master_client_.PutStart(key, slice_lengths, client_cfg);
             if (!start_result &&
                 start_result.error() == ErrorCode::OBJECT_ALREADY_EXISTS &&
-                healDanglingLocalDiskReplica(key) == DiskReplicaHealResult::kEvicted) {
-                start_result = master_client_.PutStart(key, slice_lengths, client_cfg);
+                healDanglingLocalDiskReplica(key) ==
+                    DiskReplicaHealResult::kEvicted) {
+                start_result =
+                    master_client_.PutStart(key, slice_lengths, client_cfg);
             }
             if (!start_result) {
                 ErrorCode err = start_result.error();
                 if (err == ErrorCode::OBJECT_ALREADY_EXISTS) {
                     VLOG(1) << "object_already_exists key=" << key;
                     native_result = tl::expected<void, ErrorCode>{};
-                break;
+                    break;
                 }
                 if (err == ErrorCode::NO_AVAILABLE_HANDLE) {
-                    LOG(WARNING) << "Failed to start put operation for key=" << key
-                                 << PUT_NO_SPACE_HELPER_STR;
+                    LOG(WARNING)
+                        << "Failed to start put operation for key=" << key
+                        << PUT_NO_SPACE_HELPER_STR;
                 } else {
-                    LOG(ERROR) << "Failed to start put operation for key=" << key
-                               << ": " << toString(err);
+                    LOG(ERROR)
+                        << "Failed to start put operation for key=" << key
+                        << ": " << toString(err);
                 }
                 native_result = tl::unexpected(err);
                 break;
@@ -2042,8 +2048,8 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
             // Record Put transfer latency (all replicas)
             auto t0_put = std::chrono::steady_clock::now();
 
-            // We must deal with disk replica first, then the disk putrevoke/putend can
-            // be called surely
+            // We must deal with disk replica first, then the disk
+            // putrevoke/putend can be called surely
             if (storage_backend_) {
                 for (auto it = start_result.value().rbegin();
                      it != start_result.value().rend(); ++it) {
@@ -2065,7 +2071,8 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
                                                   : ReplicaType::NOF_SSD;
                     ErrorCode transfer_err = TransferWrite(replica, slices);
                     if (transfer_err != ErrorCode::OK) {
-                        transfer_summary.RecordFailure(replica_type, transfer_err);
+                        transfer_summary.RecordFailure(replica_type,
+                                                       transfer_err);
                         continue;
                     }
                     transfer_summary.RecordSuccess(replica_type);
@@ -2090,14 +2097,15 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
                     if (dfs_result == ErrorCode::OK) {
                         transfer_summary.RecordSuccess(ReplicaType::DFS);
                     } else {
-                        transfer_summary.RecordFailure(ReplicaType::DFS, dfs_result);
+                        transfer_summary.RecordFailure(ReplicaType::DFS,
+                                                       dfs_result);
                     }
                 }
             } else if (transfer_summary.allocated_dfs_replicas > 0) {
-                // A DFS replica was allocated but is abandoned because a peer replica
-                // failed first. Without this counter the write simply disappears: no
-                // error is recorded against DFS and no I/O is attempted. Counted per
-                // key, matching SubmitDfsWrites.
+                // A DFS replica was allocated but is abandoned because a peer
+                // replica failed first. Without this counter the write simply
+                // disappears: no error is recorded against DFS and no I/O is
+                // attempted. Counted per key, matching SubmitDfsWrites.
                 VLOG(1) << "Skipping DFS write, action=skip, key=" << key
                         << ", reason=non_dfs_transfer_failed";
                 if (auto* dfs_metric = GetDfsMetricPtr()) {
@@ -2116,23 +2124,24 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
                 DetermineFinalizeDecision(config, transfer_summary);
 
             if (finalize_decision.end_type.has_value()) {
-                auto end_result = master_client_.PutEnd(
-                    ObjectMeta{key, object_checksum}, *finalize_decision.end_type);
+                auto end_result =
+                    master_client_.PutEnd(ObjectMeta{key, object_checksum},
+                                          *finalize_decision.end_type);
                 if (!end_result) {
                     ErrorCode err = end_result.error();
                     LOG(ERROR) << "Failed to end put operation: " << err;
                     native_result = tl::unexpected(err);
-                break;
+                    break;
                 }
             }
 
             if (finalize_decision.revoke_type.has_value()) {
-                auto revoke_result =
-                    master_client_.PutRevoke(key, *finalize_decision.revoke_type);
+                auto revoke_result = master_client_.PutRevoke(
+                    key, *finalize_decision.revoke_type);
                 if (!revoke_result) {
                     LOG(ERROR) << "Failed to revoke put operation";
                     native_result = tl::unexpected(revoke_result.error());
-                break;
+                    break;
                 }
             }
 
@@ -2142,22 +2151,30 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
             }
 
             native_result = tl::expected<void, ErrorCode>{};
-                break;
+            break;
         } while (false);
     } catch (...) {
         if (external_store_backend_ && external_task && *external_task) {
-            external_store_backend_->Wait(*external_task, external_wait_timeout_ms_);
+            try {
+                external_store_backend_->Wait(*external_task,
+                                              external_wait_timeout_ms_);
+            } catch (...) {
+                std::terminate();
+            }
         }
         throw;
     }
     if (!external_store_backend_) return native_result;
-    auto external_results = external_task && *external_task
-        ? external_store_backend_->Wait(*external_task, external_wait_timeout_ms_)
-        : std::vector<tl::expected<void, ErrorCode>>(
-              1, tl::unexpected(external_task ? ErrorCode::INTERNAL_ERROR
-                                                     : external_task.error()));
+    auto external_results =
+        external_task && *external_task
+            ? external_store_backend_->Wait(*external_task,
+                                            external_wait_timeout_ms_)
+            : std::vector<tl::expected<void, ErrorCode>>(
+                  1, tl::unexpected(external_task ? ErrorCode::INTERNAL_ERROR
+                                                  : external_task.error()));
     external_detail::CheckResults(external_results, 1);
-    return external_detail::MergePutResults({std::move(native_result)}, external_results)[0];
+    return external_detail::MergePutResults({std::move(native_result)},
+                                            external_results)[0];
 }
 
 namespace {
@@ -2269,11 +2286,13 @@ tl::expected<void, ErrorCode> Client::Upsert(const ObjectKey& key,
             if (!start_result) {
                 ErrorCode err = start_result.error();
                 if (err == ErrorCode::NO_AVAILABLE_HANDLE) {
-                    LOG(WARNING) << "Failed to start upsert operation for key=" << key
-                                 << PUT_NO_SPACE_HELPER_STR;
+                    LOG(WARNING)
+                        << "Failed to start upsert operation for key=" << key
+                        << PUT_NO_SPACE_HELPER_STR;
                 } else {
-                    LOG(ERROR) << "Failed to start upsert operation for key=" << key
-                               << ": " << toString(err);
+                    LOG(ERROR)
+                        << "Failed to start upsert operation for key=" << key
+                        << ": " << toString(err);
                 }
                 native_result = tl::unexpected(err);
                 break;
@@ -2308,7 +2327,8 @@ tl::expected<void, ErrorCode> Client::Upsert(const ObjectKey& key,
                                                   : ReplicaType::NOF_SSD;
                     ErrorCode transfer_err = TransferWrite(replica, slices);
                     if (transfer_err != ErrorCode::OK) {
-                        transfer_summary.RecordFailure(replica_type, transfer_err);
+                        transfer_summary.RecordFailure(replica_type,
+                                                       transfer_err);
                         continue;
                     }
                     transfer_summary.RecordSuccess(replica_type);
@@ -2333,13 +2353,15 @@ tl::expected<void, ErrorCode> Client::Upsert(const ObjectKey& key,
                     if (dfs_result == ErrorCode::OK) {
                         transfer_summary.RecordSuccess(ReplicaType::DFS);
                     } else {
-                        transfer_summary.RecordFailure(ReplicaType::DFS, dfs_result);
+                        transfer_summary.RecordFailure(ReplicaType::DFS,
+                                                       dfs_result);
                     }
                 }
             } else if (transfer_summary.allocated_dfs_replicas > 0) {
-                // Same abandoned-write case as in Put: the DFS replica was allocated
-                // but a peer replica failed first, so no I/O is attempted and no DFS
-                // error is recorded. Counted per key, matching SubmitDfsWrites.
+                // Same abandoned-write case as in Put: the DFS replica was
+                // allocated but a peer replica failed first, so no I/O is
+                // attempted and no DFS error is recorded. Counted per key,
+                // matching SubmitDfsWrites.
                 VLOG(1) << "Skipping DFS write, action=skip, key=" << key
                         << ", reason=non_dfs_transfer_failed";
                 if (auto* dfs_metric = GetDfsMetricPtr()) {
@@ -2357,22 +2379,23 @@ tl::expected<void, ErrorCode> Client::Upsert(const ObjectKey& key,
             const auto finalize_decision =
                 DetermineFinalizeDecision(config, transfer_summary);
             if (finalize_decision.end_type.has_value()) {
-                auto end_result = master_client_.UpsertEnd(
-                    ObjectMeta{key, object_checksum}, *finalize_decision.end_type);
+                auto end_result =
+                    master_client_.UpsertEnd(ObjectMeta{key, object_checksum},
+                                             *finalize_decision.end_type);
                 if (!end_result) {
                     ErrorCode err = end_result.error();
                     LOG(ERROR) << "Failed to end upsert operation: " << err;
                     native_result = tl::unexpected(err);
-                break;
+                    break;
                 }
             }
             if (finalize_decision.revoke_type.has_value()) {
-                auto revoke_result =
-                    master_client_.UpsertRevoke(key, *finalize_decision.revoke_type);
+                auto revoke_result = master_client_.UpsertRevoke(
+                    key, *finalize_decision.revoke_type);
                 if (!revoke_result) {
                     LOG(ERROR) << "Failed to revoke upsert operation";
                     native_result = tl::unexpected(revoke_result.error());
-                break;
+                    break;
                 }
             }
             if (!finalize_decision.success) {
@@ -2380,31 +2403,40 @@ tl::expected<void, ErrorCode> Client::Upsert(const ObjectKey& key,
                 break;
             }
 
-            // Success-side invalidation: a concurrent read between the pre-upsert
-            // RemoveHotKey() and UpsertEnd could have read the old value and submitted
-            // an async hot-cache fill with a still-valid token. Invalidate again now
-            // that the new value is committed so that stale fill cannot publish.
+            // Success-side invalidation: a concurrent read between the
+            // pre-upsert RemoveHotKey() and UpsertEnd could have read the old
+            // value and submitted an async hot-cache fill with a still-valid
+            // token. Invalidate again now that the new value is committed so
+            // that stale fill cannot publish.
             if (hot_cache_) {
                 hot_cache_->RemoveHotKey(key);
             }
 
             native_result = tl::expected<void, ErrorCode>{};
-                break;
+            break;
         } while (false);
     } catch (...) {
         if (external_store_backend_ && external_task && *external_task) {
-            external_store_backend_->Wait(*external_task, external_wait_timeout_ms_);
+            try {
+                external_store_backend_->Wait(*external_task,
+                                              external_wait_timeout_ms_);
+            } catch (...) {
+                std::terminate();
+            }
         }
         throw;
     }
     if (!external_store_backend_) return native_result;
-    auto external_results = external_task && *external_task
-        ? external_store_backend_->Wait(*external_task, external_wait_timeout_ms_)
-        : std::vector<tl::expected<void, ErrorCode>>(
-              1, tl::unexpected(external_task ? ErrorCode::INTERNAL_ERROR
-                                                     : external_task.error()));
+    auto external_results =
+        external_task && *external_task
+            ? external_store_backend_->Wait(*external_task,
+                                            external_wait_timeout_ms_)
+            : std::vector<tl::expected<void, ErrorCode>>(
+                  1, tl::unexpected(external_task ? ErrorCode::INTERNAL_ERROR
+                                                  : external_task.error()));
     external_detail::CheckResults(external_results, 1);
-    return external_detail::MergePutResults({std::move(native_result)}, external_results)[0];
+    return external_detail::MergePutResults({std::move(native_result)},
+                                            external_results)[0];
 }
 
 // TODO: `client.cpp` is too long, consider split it into multiple files
@@ -3687,7 +3719,8 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPut(
     tl::expected<void*, ErrorCode> external_task =
         tl::unexpected(ErrorCode::INTERNAL_ERROR);
     if (external_store_backend_) {
-        external_task = external_store_backend_->BatchPut(tenant_id(), keys, batched_slices);
+        external_task = external_store_backend_->BatchPut(tenant_id(), keys,
+                                                          batched_slices);
     }
     std::vector<tl::expected<void, ErrorCode>> native_result;
     try {
@@ -3714,22 +3747,31 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPut(
 
             FinalizeBatchPut(ops);
             native_result = CollectResults(ops);
-                break;
+            break;
         } while (false);
     } catch (...) {
         if (external_store_backend_ && external_task && *external_task) {
-            external_store_backend_->Wait(*external_task, external_wait_timeout_ms_);
+            try {
+                external_store_backend_->Wait(*external_task,
+                                              external_wait_timeout_ms_);
+            } catch (...) {
+                std::terminate();
+            }
         }
         throw;
     }
     if (!external_store_backend_) return native_result;
-    auto external_results = external_task && *external_task
-        ? external_store_backend_->Wait(*external_task, external_wait_timeout_ms_)
-        : std::vector<tl::expected<void, ErrorCode>>(
-              keys.size(), tl::unexpected(external_task ? ErrorCode::INTERNAL_ERROR
-                                                     : external_task.error()));
+    auto external_results =
+        external_task && *external_task
+            ? external_store_backend_->Wait(*external_task,
+                                            external_wait_timeout_ms_)
+            : std::vector<tl::expected<void, ErrorCode>>(
+                  keys.size(),
+                  tl::unexpected(external_task ? ErrorCode::INTERNAL_ERROR
+                                               : external_task.error()));
     external_detail::CheckResults(external_results, keys.size());
-    return external_detail::MergePutResults(std::move(native_result), external_results);
+    return external_detail::MergePutResults(std::move(native_result),
+                                            external_results);
 }
 
 // Defined after PutOperation: std::vector<PutOperation> must be instantiated
@@ -3769,7 +3811,8 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchUpsert(
     tl::expected<void*, ErrorCode> external_task =
         tl::unexpected(ErrorCode::INTERNAL_ERROR);
     if (external_store_backend_) {
-        external_task = external_store_backend_->BatchPut(tenant_id(), keys, batched_slices);
+        external_task = external_store_backend_->BatchPut(tenant_id(), keys,
+                                                          batched_slices);
     }
     std::vector<tl::expected<void, ErrorCode>> native_result;
     try {
@@ -3796,22 +3839,31 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchUpsert(
 
             FinalizeBatchUpsert(ops);
             native_result = CollectResults(ops);
-                break;
+            break;
         } while (false);
     } catch (...) {
         if (external_store_backend_ && external_task && *external_task) {
-            external_store_backend_->Wait(*external_task, external_wait_timeout_ms_);
+            try {
+                external_store_backend_->Wait(*external_task,
+                                              external_wait_timeout_ms_);
+            } catch (...) {
+                std::terminate();
+            }
         }
         throw;
     }
     if (!external_store_backend_) return native_result;
-    auto external_results = external_task && *external_task
-        ? external_store_backend_->Wait(*external_task, external_wait_timeout_ms_)
-        : std::vector<tl::expected<void, ErrorCode>>(
-              keys.size(), tl::unexpected(external_task ? ErrorCode::INTERNAL_ERROR
-                                                     : external_task.error()));
+    auto external_results =
+        external_task && *external_task
+            ? external_store_backend_->Wait(*external_task,
+                                            external_wait_timeout_ms_)
+            : std::vector<tl::expected<void, ErrorCode>>(
+                  keys.size(),
+                  tl::unexpected(external_task ? ErrorCode::INTERNAL_ERROR
+                                               : external_task.error()));
     external_detail::CheckResults(external_results, keys.size());
-    return external_detail::MergePutResults(std::move(native_result), external_results);
+    return external_detail::MergePutResults(std::move(native_result),
+                                            external_results);
 }
 
 std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
@@ -3893,20 +3945,27 @@ tl::expected<void, ErrorCode> Client::Remove(const ObjectKey& key, bool force) {
             }
 
             native_result = tl::expected<void, ErrorCode>{};
-                break;
+            break;
         } while (false);
     } catch (...) {
         if (external_store_backend_ && external_task && *external_task) {
-            external_store_backend_->Wait(*external_task, external_wait_timeout_ms_);
+            try {
+                external_store_backend_->Wait(*external_task,
+                                              external_wait_timeout_ms_);
+            } catch (...) {
+                std::terminate();
+            }
         }
         throw;
     }
     if (!external_store_backend_) return native_result;
-    auto external_results = external_task && *external_task
-        ? external_store_backend_->Wait(*external_task, external_wait_timeout_ms_)
-        : std::vector<tl::expected<void, ErrorCode>>(
-              1, tl::unexpected(external_task ? ErrorCode::INTERNAL_ERROR
-                                                     : external_task.error()));
+    auto external_results =
+        external_task && *external_task
+            ? external_store_backend_->Wait(*external_task,
+                                            external_wait_timeout_ms_)
+            : std::vector<tl::expected<void, ErrorCode>>(
+                  1, tl::unexpected(external_task ? ErrorCode::INTERNAL_ERROR
+                                                  : external_task.error()));
     external_detail::CheckResults(external_results, 1);
     return native_result;
 }
@@ -3988,20 +4047,28 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchRemove(
             }
 
             native_result = results;
-                break;
+            break;
         } while (false);
     } catch (...) {
         if (external_store_backend_ && external_task && *external_task) {
-            external_store_backend_->Wait(*external_task, external_wait_timeout_ms_);
+            try {
+                external_store_backend_->Wait(*external_task,
+                                              external_wait_timeout_ms_);
+            } catch (...) {
+                std::terminate();
+            }
         }
         throw;
     }
     if (!external_store_backend_) return native_result;
-    auto external_results = external_task && *external_task
-        ? external_store_backend_->Wait(*external_task, external_wait_timeout_ms_)
-        : std::vector<tl::expected<void, ErrorCode>>(
-              keys.size(), tl::unexpected(external_task ? ErrorCode::INTERNAL_ERROR
-                                                     : external_task.error()));
+    auto external_results =
+        external_task && *external_task
+            ? external_store_backend_->Wait(*external_task,
+                                            external_wait_timeout_ms_)
+            : std::vector<tl::expected<void, ErrorCode>>(
+                  keys.size(),
+                  tl::unexpected(external_task ? ErrorCode::INTERNAL_ERROR
+                                               : external_task.error()));
     external_detail::CheckResults(external_results, keys.size());
     return native_result;
 }
@@ -4294,7 +4361,6 @@ void Client::OnGracefulUnmountTimer(const UUID& segment_id, int retry_left) {
 tl::expected<void, ErrorCode> Client::RegisterLocalMemory(
     void* addr, size_t length, const std::string& location,
     bool remote_accessible, bool update_metadata) {
-    std::lock_guard<std::recursive_mutex> lock(external_store_mutex_);
     auto check_result = CheckRegisterMemoryParams(addr, length, protocol_);
     if (!check_result) {
         return tl::unexpected(check_result.error());
@@ -4303,25 +4369,11 @@ tl::expected<void, ErrorCode> Client::RegisterLocalMemory(
             addr, length, location, remote_accessible, update_metadata) != 0) {
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
-    if (external_store_backend_) {
-        auto registered = RegisterExternalMemory(addr, length);
-        if (!registered) {
-            transfer_engine_->unregisterLocalMemory(addr, update_metadata);
-            return registered;
-        }
-    }
     return {};
 }
 
 tl::expected<void, ErrorCode> Client::unregisterLocalMemory(
     void* addr, bool update_metadata) {
-    std::lock_guard<std::recursive_mutex> lock(external_store_mutex_);
-    if (external_store_backend_ && external_regions_.count(addr)) {
-        auto result = external_store_backend_->UnregisterRegions(
-            {external_regions_.at(addr)});
-        if (!result) return result;
-        external_regions_.erase(addr);
-    }
     if (this->transfer_engine_->unregisterLocalMemory(addr, update_metadata) !=
         0) {
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
