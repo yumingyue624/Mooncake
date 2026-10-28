@@ -34,9 +34,6 @@ class ExternalStoreBackend {
                                                   const ObjectKey& key) = 0;
     virtual tl::expected<void*, ErrorCode> BatchRemove(
         const TenantId& tenant_id, const std::vector<ObjectKey>& keys) = 0;
-    // Consumes the task once and returns one result per input key, in order.
-    virtual std::vector<tl::expected<void, ErrorCode>> Wait(
-        void* task, uint64_t timeout_ms) = 0;
 
     // exists is non-null and stays valid until Wait returns.
     // Successful query items report 0 (missing) or 1 (present).

@@ -2032,7 +2032,7 @@ std::vector<tl::expected<void, ErrorCode>> Client::WaitExternal(
         return {};
     }
     if (!*submission) return {};
-    auto results = external_store_backend_->Wait(*submission, 0);
+    auto results = external_store_backend_->Wait(*submission);
     for (size_t i = 0; i < results.size(); ++i) {
         if (!results[i]) {
             LOG(WARNING) << "External store operation failed at index=" << i
