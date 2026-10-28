@@ -3838,6 +3838,22 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPutRevoke(
     return master_client_.BatchPutRevoke(keys, replica_type);
 }
 
+void Client::FinishExternalRemove(
+    const tl::expected<void*, ErrorCode>& submission) {
+    if (!submission) {
+        LOG(WARNING) << "External delete submission failed: "
+                     << submission.error();
+    } else if (*submission) {
+        auto results = WaitExternal(*submission);
+        for (size_t i = 0; i < results.size(); ++i) {
+            if (!results[i]) {
+                LOG(WARNING) << "External delete failed at index=" << i << ": "
+                             << results[i].error();
+            }
+        }
+    }
+}
+
 tl::expected<void, ErrorCode> Client::Remove(const ObjectKey& key, bool force) {
     auto external = external_store_backend_
                         ? external_store_backend_->Remove(
@@ -3848,18 +3864,7 @@ tl::expected<void, ErrorCode> Client::Remove(const ObjectKey& key, bool force) {
     }
 
     auto result = master_client_.Remove(key, force);
-    if (!external) {
-        LOG(WARNING) << "External delete submission failed: "
-                     << external.error();
-    } else if (*external) {
-        auto external_results = WaitExternal(*external);
-        for (size_t i = 0; i < external_results.size(); ++i) {
-            if (!external_results[i]) {
-                LOG(WARNING) << "External delete failed at index=" << i << ": "
-                             << external_results[i].error();
-            }
-        }
-    }
+    FinishExternalRemove(external);
     // if (storage_backend_) {
     //     storage_backend_->RemoveFile(key);
     // }
@@ -3921,18 +3926,7 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchRemove(
     }
 
     auto results = master_client_.BatchRemove(keys, force);
-    if (!external) {
-        LOG(WARNING) << "External delete submission failed: "
-                     << external.error();
-    } else if (*external) {
-        auto external_results = WaitExternal(*external);
-        for (size_t i = 0; i < external_results.size(); ++i) {
-            if (!external_results[i]) {
-                LOG(WARNING) << "External delete failed at index=" << i << ": "
-                             << external_results[i].error();
-            }
-        }
-    }
+    FinishExternalRemove(external);
 
     if (hot_cache_) {
         std::vector<std::string> removed_keys;
