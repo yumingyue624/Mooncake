@@ -437,119 +437,118 @@ KvClientBackend::SubmitLoads(
     });
 }
 
+tl::expected<std::optional<KvClientBackend::StoreLayout>, ErrorCode>
+KvClientBackend::ResolveStoreLayout(const ObjectKey& key,
+                                    const std::vector<Slice>& slices) const {
+    if (!layout_) return std::optional<StoreLayout>{};
+    auto parsed = ParseVllmKey(key);
+    if (!parsed) return tl::unexpected(parsed.error());
+    if (parsed->pp_rank >= layout_->pp_size ||
+        parsed->pcp_rank >= layout_->pcp_size ||
+        parsed->dcp_rank >= layout_->dcp_size ||
+        parsed->head_or_tp_rank >= layout_->kv_group_slots ||
+        (parsed->layer && *parsed->layer >= layout_->layer_slots))
+        return tl::unexpected(ErrorCode::INVALID_KEY);
+    uint64_t layer_bytes = 0;
+    for (const auto& slice : slices) {
+        if (slice.size > std::numeric_limits<uint64_t>::max() - layer_bytes)
+            return tl::unexpected(ErrorCode::INVALID_PARAMS);
+        layer_bytes += slice.size;
+    }
+    // PP=1: non-layerwise inputs contain layer_slots equal-sized layers.
+    const auto layers = parsed->layer ? uint64_t{1} : layout_->layer_slots;
+    if (layer_bytes == 0 || layer_bytes % layers != 0)
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    layer_bytes /= layers;
+    if (layer_bytes > layout_->group_slot_bytes || layer_bytes % 512 != 0)
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    const auto base_offset =
+        ((((parsed->pp_rank * layout_->pcp_size + parsed->pcp_rank) *
+               layout_->dcp_size +
+           parsed->dcp_rank) *
+              layout_->layer_slots +
+          parsed->layer.value_or(0)) *
+             layout_->kv_group_slots +
+         parsed->head_or_tp_rank) *
+        layout_->group_slot_bytes;
+    return std::optional<StoreLayout>{
+        StoreLayout{base_offset, layer_bytes,
+                    layout_->kv_group_slots * layout_->group_slot_bytes}};
+}
+
+tl::expected<const kv::RegisteredMemory*, ErrorCode>
+KvClientBackend::FindRegisteredMemory(const Slice& slice) const {
+    const auto addr = reinterpret_cast<uintptr_t>(slice.ptr);
+    auto region = regions_.upper_bound(addr);
+    if (region == regions_.begin())
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    const auto& registered = std::prev(region)->second;
+    const auto offset = addr - registered.region.addr;
+    if (offset > registered.region.size || slice.size == 0 ||
+        slice.size > registered.region.size - offset)
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    if (registered.region.memoryType != kv::MemoryType::DEVICE)
+        return tl::unexpected(ErrorCode::NOT_SUPPORTED);
+    return &registered;
+}
+
+tl::expected<void, ErrorCode> KvClientBackend::AppendStoreEntries(
+    const kv::CacheKey& key, const std::vector<Slice>& slices,
+    const std::optional<StoreLayout>& layout,
+    std::vector<kv::KVBuffer>& entries) {
+    if (slices.empty()) return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    uint64_t logical_offset = 0;
+    for (const auto& slice : slices) {
+        auto registered = FindRegisteredMemory(slice);
+        if (!registered) return tl::unexpected(registered.error());
+        const auto addr = reinterpret_cast<uintptr_t>(slice.ptr);
+        uint64_t consumed = 0;
+        while (consumed < slice.size) {
+            uint64_t object_offset = 0;
+            uint64_t length = slice.size - consumed;
+            if (layout) {
+                const auto layer = logical_offset / layout->layer_bytes;
+                const auto within_layer = logical_offset % layout->layer_bytes;
+                object_offset = layout->base_offset +
+                                layer * layout->layer_stride + within_layer;
+                // Split descriptors, never pad or copy source payload.
+                length = std::min({length, layout->layer_bytes - within_layer,
+                                   uint64_t{0x00fffe00}});
+                if (object_offset % 512 != 0 || length % 512 != 0)
+                    return tl::unexpected(ErrorCode::INVALID_PARAMS);
+            }
+            kv::KVBuffer entry{};
+            entry.key = key;
+            entry.buffer.region = (*registered)->region;
+            entry.buffer.region.addr = addr + consumed;
+            entry.buffer.region.size = length;
+            entry.buffer.handle = (*registered)->handle;
+            entry.offset = static_cast<uint32_t>(object_offset);
+            entries.push_back(entry);
+            consumed += length;
+            if (layout) logical_offset += length;
+        }
+    }
+    return {};
+}
+
 std::vector<kv::KVBuffer> KvClientBackend::BuildStoreEntries(
     const TenantId& tenant_id, const std::vector<ObjectKey>& keys,
     const std::vector<std::vector<Slice>>& batched_slices,
     std::vector<size_t>& indices,
     std::vector<tl::expected<void, ErrorCode>>& results) {
-    // The caller holds memory_mutex_.
+    // The caller holds memory_mutex_ throughout layout/registration resolution.
     std::vector<kv::KVBuffer> entries;
     results.resize(keys.size());
     for (size_t i = 0; i < keys.size(); ++i) {
-        uint64_t layer_bytes = 0;
-        std::optional<VllmKey> parsed;
-        if (layout_) {
-            auto key = ParseVllmKey(keys[i]);
-            if (!key) {
-                results[i] = tl::unexpected(key.error());
-                continue;
-            }
-            parsed = *key;
-            if (parsed->pp_rank >= layout_->pp_size ||
-                parsed->pcp_rank >= layout_->pcp_size ||
-                parsed->dcp_rank >= layout_->dcp_size ||
-                parsed->head_or_tp_rank >= layout_->kv_group_slots ||
-                (parsed->layer && *parsed->layer >= layout_->layer_slots)) {
-                results[i] = tl::unexpected(ErrorCode::INVALID_KEY);
-                continue;
-            }
-            for (const auto& slice : batched_slices[i]) {
-                if (slice.size >
-                    std::numeric_limits<uint64_t>::max() - layer_bytes) {
-                    results[i] = tl::unexpected(ErrorCode::INVALID_PARAMS);
-                    break;
-                }
-                layer_bytes += slice.size;
-            }
-            if (!results[i]) continue;
-            // Non-layerwise input contains every layer in layer order. With
-            // PP=1, layer_slots is the actual layer count, without spare slots.
-            const auto layers =
-                parsed->layer ? uint64_t{1} : layout_->layer_slots;
-            if (layer_bytes == 0 || layer_bytes % layers != 0) {
-                results[i] = tl::unexpected(ErrorCode::INVALID_PARAMS);
-                continue;
-            }
-            layer_bytes /= layers;
-            if (layer_bytes > layout_->group_slot_bytes ||
-                layer_bytes % 512 != 0) {
-                results[i] = tl::unexpected(ErrorCode::INVALID_PARAMS);
-                continue;
-            }
+        auto layout = ResolveStoreLayout(keys[i], batched_slices[i]);
+        if (!layout) {
+            results[i] = tl::unexpected(layout.error());
+            continue;
         }
-        const auto key = EncodeKey(keys[i], tenant_id);
         const auto begin = entries.size();
-        uint64_t logical_offset = 0;
-        if (batched_slices[i].empty())
-            results[i] = tl::unexpected(ErrorCode::INVALID_PARAMS);
-        for (const auto& slice : batched_slices[i]) {
-            const auto addr = reinterpret_cast<uintptr_t>(slice.ptr);
-            auto region = regions_.upper_bound(addr);
-            if (region == regions_.begin()) {
-                results[i] = tl::unexpected(ErrorCode::INVALID_PARAMS);
-                break;
-            }
-            const auto& registered = std::prev(region)->second;
-            const auto region_offset = addr - registered.region.addr;
-            if (region_offset > registered.region.size || slice.size == 0 ||
-                slice.size > registered.region.size - region_offset) {
-                results[i] = tl::unexpected(ErrorCode::INVALID_PARAMS);
-                break;
-            }
-            if (registered.region.memoryType != kv::MemoryType::DEVICE) {
-                results[i] = tl::unexpected(ErrorCode::NOT_SUPPORTED);
-                break;
-            }
-            uint64_t consumed = 0;
-            while (consumed < slice.size) {
-                uint64_t object_offset = 0;
-                uint64_t length = slice.size - consumed;
-                if (parsed) {
-                    const auto layer =
-                        parsed->layer.value_or(logical_offset / layer_bytes);
-                    const auto within_layer = logical_offset % layer_bytes;
-                    object_offset = ((((parsed->pp_rank * layout_->pcp_size +
-                                        parsed->pcp_rank) *
-                                           layout_->dcp_size +
-                                       parsed->dcp_rank) *
-                                          layout_->layer_slots +
-                                      layer) *
-                                         layout_->kv_group_slots +
-                                     parsed->head_or_tp_rank) *
-                                        layout_->group_slot_bytes +
-                                    within_layer;
-                    // Split descriptors at layer and protocol boundaries;
-                    // never pad, copy or transmit beyond a source Slice.
-                    length = std::min({length, layer_bytes - within_layer,
-                                       uint64_t{0x00fffe00}});
-                    if (object_offset % 512 != 0 || length % 512 != 0) {
-                        results[i] = tl::unexpected(ErrorCode::INVALID_PARAMS);
-                        break;
-                    }
-                }
-                kv::KVBuffer entry{};
-                entry.key = key;
-                entry.buffer.region = registered.region;
-                entry.buffer.region.addr = addr + consumed;
-                entry.buffer.region.size = length;
-                entry.buffer.handle = registered.handle;
-                entry.offset = static_cast<uint32_t>(object_offset);
-                entries.push_back(entry);
-                consumed += length;
-                if (parsed) logical_offset += length;
-            }
-            if (!results[i]) break;
-        }
+        results[i] = AppendStoreEntries(EncodeKey(keys[i], tenant_id),
+                                        batched_slices[i], *layout, entries);
         if (!results[i]) {
             entries.resize(begin);
             continue;
