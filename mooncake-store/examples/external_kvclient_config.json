@@ -1,0 +1,12 @@
+{
+  "external_store_backend": "kvclient",
+  "external_store_options": {
+    "config_path": "/path/to/kvclient.conf",
+    "pp_size": "1",
+    "pcp_size": "1",
+    "dcp_size": "1",
+    "layer_slots": "32",
+    "kv_group_slots": "8",
+    "group_slot_bytes": "65536"
+  }
+}
