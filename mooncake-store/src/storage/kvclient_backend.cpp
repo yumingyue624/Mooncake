@@ -1,12 +1,14 @@
 #include "storage/kvclient_backend.h"
 
 #include <algorithm>
+#include <array>
 #include <charconv>
 #include <cstring>
 #include <functional>
 #include <iterator>
 #include <limits>
 #include <mutex>
+#include <string_view>
 #include <xxhash.h>
 #include <utility>
 
@@ -14,6 +16,60 @@
 
 namespace mooncake {
 namespace {
+
+struct VllmKey {
+    std::string_view model_name;
+    std::string_view chunk_hash;
+    uint64_t pp_rank = 0;
+    uint64_t pcp_rank = 0;
+    uint64_t dcp_rank = 0;
+    uint64_t head_or_tp_rank = 0;
+    std::optional<uint64_t> layer;
+};
+
+bool ParseRank(std::string_view field, std::string_view prefix,
+               uint64_t& value) {
+    if (!field.starts_with(prefix)) return false;
+    field.remove_prefix(prefix.size());
+    const auto [end, error] =
+        std::from_chars(field.data(), field.data() + field.size(), value);
+    return error == std::errc{} && end == field.data() + field.size();
+}
+
+tl::expected<VllmKey, ErrorCode> ParseVllmKey(std::string_view key) {
+    std::array<std::string_view, 6> fields;
+    for (size_t i = 0; i < fields.size() - 1; ++i) {
+        const auto end = key.find('@');
+        if (end == std::string_view::npos)
+            return tl::unexpected(ErrorCode::INVALID_KEY);
+        fields[i] = key.substr(0, end);
+        key.remove_prefix(end + 1);
+    }
+    fields.back() = key;
+    if (key.find('@') != std::string_view::npos || fields[0].empty())
+        return tl::unexpected(ErrorCode::INVALID_KEY);
+    VllmKey parsed;
+    parsed.model_name = fields[0];
+    if (!ParseRank(fields[1], "pcp", parsed.pcp_rank) ||
+        !ParseRank(fields[2], "dcp", parsed.dcp_rank) ||
+        !ParseRank(fields[3], "head_or_tp_rank:", parsed.head_or_tp_rank))
+        return tl::unexpected(ErrorCode::INVALID_KEY);
+    if (fields[4].starts_with("pp_rank:")) {
+        if (!ParseRank(fields[4], "pp_rank:", parsed.pp_rank))
+            return tl::unexpected(ErrorCode::INVALID_KEY);
+        parsed.chunk_hash = fields[5];
+    } else {
+        // Current LayerPoolKey omits PP rank; only PP=1 is supported.
+        uint64_t layer;
+        if (!ParseRank(fields[5], "", layer))
+            return tl::unexpected(ErrorCode::INVALID_KEY);
+        parsed.layer = layer;
+        parsed.chunk_hash = fields[4];
+    }
+    if (parsed.chunk_hash.empty())
+        return tl::unexpected(ErrorCode::INVALID_KEY);
+    return parsed;
+}
 
 ErrorCode ToError(const kv::Status& status) {
     switch (status.code) {
@@ -50,8 +106,16 @@ ErrorCode ToError(const kv::Status& status) {
 
 kv::CacheKey KvClientBackend::EncodeKey(const ObjectKey& key,
                                         const TenantId& tenant_id) {
-    // Scope by tenant before encoding the SDK key.
-    const auto scoped_key = tenant_id.MakeScopedKey(key);
+    std::string identity = key;
+    if (layout_) {
+        auto parsed = ParseVllmKey(key);
+        if (parsed) {
+            identity.assign(parsed->model_name);
+            identity.push_back('\0');
+            identity.append(parsed->chunk_hash);
+        }
+    }
+    const auto scoped_key = tenant_id.MakeScopedKey(identity);
     const uint64_t hash = XXH64(scoped_key.data(), scoped_key.size(), 0);
     XXH64_canonical_t canonical;
     XXH64_canonicalFromHash(&canonical, hash);
@@ -133,6 +197,10 @@ tl::expected<void, ErrorCode> KvClientBackend::Init(
         }
         if (layout.group_slot_bytes % 512 != 0)
             return tl::unexpected(ErrorCode::INVALID_PARAMS);
+        if (layout.pp_size != 1 ||
+            layout.object_capacity >
+                uint64_t{std::numeric_limits<uint32_t>::max()} + 1)
+            return tl::unexpected(ErrorCode::NOT_SUPPORTED);
     }
     sdk_ = kv::CreateKvClient();
     auto status = sdk_->Init(config->second);
@@ -370,11 +438,52 @@ std::vector<kv::KVBuffer> KvClientBackend::BuildStoreEntries(
     std::vector<kv::KVBuffer> entries;
     results.resize(keys.size());
     for (size_t i = 0; i < keys.size(); ++i) {
+        uint64_t layer_bytes = 0;
+        std::optional<VllmKey> parsed;
+        if (layout_) {
+            auto key = ParseVllmKey(keys[i]);
+            if (!key) {
+                results[i] = tl::unexpected(key.error());
+                continue;
+            }
+            parsed = *key;
+            if (parsed->pp_rank >= layout_->pp_size ||
+                parsed->pcp_rank >= layout_->pcp_size ||
+                parsed->dcp_rank >= layout_->dcp_size ||
+                parsed->head_or_tp_rank >= layout_->kv_group_slots ||
+                (parsed->layer && *parsed->layer >= layout_->layer_slots)) {
+                results[i] = tl::unexpected(ErrorCode::INVALID_KEY);
+                continue;
+            }
+            for (const auto& slice : batched_slices[i]) {
+                if (slice.size >
+                    std::numeric_limits<uint64_t>::max() - layer_bytes) {
+                    results[i] = tl::unexpected(ErrorCode::INVALID_PARAMS);
+                    break;
+                }
+                layer_bytes += slice.size;
+            }
+            if (!results[i]) continue;
+            // Non-layerwise input contains every layer in layer order. With
+            // PP=1, layer_slots is the actual layer count, without spare slots.
+            const auto layers =
+                parsed->layer ? uint64_t{1} : layout_->layer_slots;
+            if (layer_bytes == 0 || layer_bytes % layers != 0) {
+                results[i] = tl::unexpected(ErrorCode::INVALID_PARAMS);
+                continue;
+            }
+            layer_bytes /= layers;
+            if (layer_bytes > layout_->group_slot_bytes ||
+                layer_bytes % 512 != 0) {
+                results[i] = tl::unexpected(ErrorCode::INVALID_PARAMS);
+                continue;
+            }
+        }
         const auto key = EncodeKey(keys[i], tenant_id);
         const auto begin = entries.size();
-        if (batched_slices[i].empty()) {
+        uint64_t logical_offset = 0;
+        if (batched_slices[i].empty())
             results[i] = tl::unexpected(ErrorCode::INVALID_PARAMS);
-        }
         for (const auto& slice : batched_slices[i]) {
             const auto addr = reinterpret_cast<uintptr_t>(slice.ptr);
             auto region = regions_.upper_bound(addr);
@@ -383,9 +492,9 @@ std::vector<kv::KVBuffer> KvClientBackend::BuildStoreEntries(
                 break;
             }
             const auto& registered = std::prev(region)->second;
-            const auto offset = addr - registered.region.addr;
-            if (offset > registered.region.size || slice.size == 0 ||
-                slice.size > registered.region.size - offset) {
+            const auto region_offset = addr - registered.region.addr;
+            if (region_offset > registered.region.size || slice.size == 0 ||
+                slice.size > registered.region.size - region_offset) {
                 results[i] = tl::unexpected(ErrorCode::INVALID_PARAMS);
                 break;
             }
@@ -393,15 +502,45 @@ std::vector<kv::KVBuffer> KvClientBackend::BuildStoreEntries(
                 results[i] = tl::unexpected(ErrorCode::NOT_SUPPORTED);
                 break;
             }
-            kv::KVBuffer entry{};
-            entry.key = key;
-            entry.buffer.region = registered.region;
-            entry.buffer.region.addr = addr;
-            entry.buffer.region.size = slice.size;
-            entry.buffer.handle = registered.handle;
-            // Object placement is provisional until the key layout is defined.
-            entry.offset = 0;
-            entries.push_back(entry);
+            uint64_t consumed = 0;
+            while (consumed < slice.size) {
+                uint64_t object_offset = 0;
+                uint64_t length = slice.size - consumed;
+                if (parsed) {
+                    const auto layer =
+                        parsed->layer.value_or(logical_offset / layer_bytes);
+                    const auto within_layer = logical_offset % layer_bytes;
+                    object_offset = ((((parsed->pp_rank * layout_->pcp_size +
+                                        parsed->pcp_rank) *
+                                           layout_->dcp_size +
+                                       parsed->dcp_rank) *
+                                          layout_->layer_slots +
+                                      layer) *
+                                         layout_->kv_group_slots +
+                                     parsed->head_or_tp_rank) *
+                                        layout_->group_slot_bytes +
+                                    within_layer;
+                    // Split descriptors at layer and protocol boundaries;
+                    // never pad, copy or transmit beyond a source Slice.
+                    length = std::min({length, layer_bytes - within_layer,
+                                       uint64_t{0x00fffe00}});
+                    if (object_offset % 512 != 0 || length % 512 != 0) {
+                        results[i] = tl::unexpected(ErrorCode::INVALID_PARAMS);
+                        break;
+                    }
+                }
+                kv::KVBuffer entry{};
+                entry.key = key;
+                entry.buffer.region = registered.region;
+                entry.buffer.region.addr = addr + consumed;
+                entry.buffer.region.size = length;
+                entry.buffer.handle = registered.handle;
+                entry.offset = static_cast<uint32_t>(object_offset);
+                entries.push_back(entry);
+                consumed += length;
+                if (parsed) logical_offset += length;
+            }
+            if (!results[i]) break;
         }
         if (!results[i]) {
             entries.resize(begin);
