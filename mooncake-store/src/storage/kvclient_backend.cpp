@@ -165,6 +165,18 @@ tl::expected<void, ErrorCode> KvClientBackend::Init(
     if (config == options.end()) {
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
+    auto layout = ParseLayoutConfig(options);
+    if (!layout) return tl::unexpected(layout.error());
+    sdk_ = kv::CreateKvClient();
+    auto status = sdk_->Init(config->second);
+    if (!status.ok()) return tl::unexpected(ToError(status));
+    layout_ = *layout;
+    return {};
+}
+
+tl::expected<std::optional<KvClientBackend::LayoutConfig>, ErrorCode>
+KvClientBackend::ParseLayoutConfig(
+    const std::unordered_map<std::string, std::string>& options) {
     LayoutConfig layout;
     const std::pair<const char*, uint64_t*> fields[] = {
         {"pp_size", &layout.pp_size},
@@ -202,11 +214,7 @@ tl::expected<void, ErrorCode> KvClientBackend::Init(
                 uint64_t{std::numeric_limits<uint32_t>::max()} + 1)
             return tl::unexpected(ErrorCode::NOT_SUPPORTED);
     }
-    sdk_ = kv::CreateKvClient();
-    auto status = sdk_->Init(config->second);
-    if (!status.ok()) return tl::unexpected(ToError(status));
-    layout_ = has_layout ? std::optional<LayoutConfig>{layout} : std::nullopt;
-    return {};
+    return has_layout ? std::optional<LayoutConfig>{layout} : std::nullopt;
 }
 
 bool KvClientBackend::SupportsMemory(
