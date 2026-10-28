@@ -827,8 +827,6 @@ class Client {
 
    private:
     friend class RealClient;
-    std::vector<tl::expected<void, ErrorCode>> WaitExternal(
-        const tl::expected<void*, ErrorCode>& submission);
     tl::expected<void, ErrorCode> FinishExternalPut(
         const tl::expected<void*, ErrorCode>& submission,
         tl::expected<void, ErrorCode> native_result);

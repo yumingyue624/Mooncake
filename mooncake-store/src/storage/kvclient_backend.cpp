@@ -186,7 +186,7 @@ kv::TaskResult KvClientBackend::WaitForCompletion(kv::TaskId task) {
     kv::TaskResult result;
     // The SDK must drain timed-out work before returning.
     auto status = sdk_->Wait(task, 0, result);  // Use the SDK default timeout.
-    if (!status.ok()) result.status = status;
+    result.status = status;
     if (!status.ok() && status.code != kv::StatusCode::PARTIAL_FAILED) {
         // Ignore provisional entry results on a task-level failure.
         result.entryStatus.clear();
