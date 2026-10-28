@@ -66,9 +66,6 @@ tl::expected<void, ErrorCode> KvClientBackend::Shutdown() {
     while (!tasks_.empty()) {
         (void)Wait(*tasks_.begin());
     }
-    while (!write_tasks_.empty()) {
-        (void)Wait(write_tasks_.begin()->first, 0);
-    }
     if (!sdk_) return {};
     // SDK shutdown also releases registered memory.
     auto status = sdk_->Shutdown();
@@ -153,7 +150,7 @@ kv::TaskResult KvClientBackend::WaitForCompletion(kv::TaskId task) {
     kv::TaskResult result;
     // The SDK must drain timed-out work before returning.
     auto status = sdk_->Wait(task, 0, result);  // Use the SDK default timeout.
-    result.status = status;
+    if (!status.ok()) result.status = status;
     if (!status.ok() && status.code != kv::StatusCode::PARTIAL_FAILED) {
         // Ignore provisional entry results on a task-level failure.
         result.entryStatus.clear();
@@ -330,33 +327,35 @@ KvClientBackend::SubmitLoads(
 
 std::vector<kv::KVBuffer> KvClientBackend::BuildStoreEntries(
     const TenantId& tenant_id, const std::vector<ObjectKey>& keys,
-    const std::vector<std::vector<Slice>>& batched_slices, WriteTask& task) {
+    const std::vector<std::vector<Slice>>& batched_slices,
+    std::vector<size_t>& indices,
+    std::vector<tl::expected<void, ErrorCode>>& results) {
     // The caller holds memory_mutex_; registrations also remain pinned until
     // the submitted task has been collected by Wait.
     std::vector<kv::KVBuffer> entries;
-    task.results.resize(keys.size());
+    results.resize(keys.size());
     for (size_t i = 0; i < keys.size(); ++i) {
         const auto key = EncodeKey(keys[i], tenant_id);
         const auto begin = entries.size();
         if (batched_slices[i].empty()) {
-            task.results[i] = tl::unexpected(ErrorCode::INVALID_PARAMS);
+            results[i] = tl::unexpected(ErrorCode::INVALID_PARAMS);
         }
         for (const auto& slice : batched_slices[i]) {
             const auto addr = reinterpret_cast<uintptr_t>(slice.ptr);
             auto region = regions_.upper_bound(addr);
             if (region == regions_.begin()) {
-                task.results[i] = tl::unexpected(ErrorCode::INVALID_PARAMS);
+                results[i] = tl::unexpected(ErrorCode::INVALID_PARAMS);
                 break;
             }
             const auto& registered = std::prev(region)->second;
             const auto offset = addr - registered.region.addr;
             if (offset > registered.region.size || slice.size == 0 ||
                 slice.size > registered.region.size - offset) {
-                task.results[i] = tl::unexpected(ErrorCode::INVALID_PARAMS);
+                results[i] = tl::unexpected(ErrorCode::INVALID_PARAMS);
                 break;
             }
             if (registered.region.memoryType != kv::MemoryType::DEVICE) {
-                task.results[i] = tl::unexpected(ErrorCode::NOT_SUPPORTED);
+                results[i] = tl::unexpected(ErrorCode::NOT_SUPPORTED);
                 break;
             }
             kv::KVBuffer entry{};
@@ -369,33 +368,61 @@ std::vector<kv::KVBuffer> KvClientBackend::BuildStoreEntries(
             entry.offset = 0;
             entries.push_back(entry);
         }
-        if (!task.results[i]) {
+        if (!results[i]) {
             entries.resize(begin);
             continue;
         }
-        task.indices.insert(task.indices.end(), entries.size() - begin, i);
+        indices.insert(indices.end(), entries.size() - begin, i);
     }
     return entries;
+}
+
+std::vector<tl::expected<void, ErrorCode>> KvClientBackend::WaitForWrite(
+    kv::TaskId task, const std::vector<size_t>& indices,
+    std::vector<tl::expected<void, ErrorCode>> results) {
+    const auto completed = WaitForCompletion(task);
+    const auto& status = completed.status;
+    const bool has_entries =
+        (status.ok() || status.code == kv::StatusCode::PARTIAL_FAILED) &&
+        completed.entryStatus.size() == indices.size();
+    for (size_t j = 0; j < indices.size(); ++j) {
+        const auto error =
+            ToError(has_entries ? completed.entryStatus[j] : status);
+        auto& item = results[indices[j]];
+        if (item && error != ErrorCode::OK) item = tl::unexpected(error);
+    }
+    return results;
+}
+
+ExternalStoreBackend::TaskHandle KvClientBackend::SaveStoreTask(
+    kv::TaskId task, std::vector<size_t> indices,
+    std::vector<tl::expected<void, ErrorCode>> results) {
+    return SaveTask([this, task, indices = std::move(indices),
+                     results = std::move(results)]() mutable {
+        auto completed = WaitForWrite(task, indices, std::move(results));
+        {
+            std::lock_guard lock(memory_mutex_);
+            --active_loads_;
+        }
+        memory_idle_.notify_all();
+        return completed;
+    });
 }
 
 tl::expected<void*, ErrorCode> KvClientBackend::Put(
     const TenantId& tenant_id, const ObjectKey& key,
     const std::vector<Slice>& slices) {
     std::unique_lock memory_lock(memory_mutex_);
-    auto task = std::make_unique<WriteTask>();
-    auto entries = BuildStoreEntries(tenant_id, {key}, {slices}, *task);
-    if (!task->results.front())
-        return tl::unexpected(task->results.front().error());
-    kv::TaskId sdk_task;
-    auto submitted = sdk_->StoreAsync(entries, sdk_task);
+    std::vector<size_t> indices;
+    std::vector<tl::expected<void, ErrorCode>> results;
+    auto entries =
+        BuildStoreEntries(tenant_id, {key}, {slices}, indices, results);
+    if (!results.front()) return tl::unexpected(results.front().error());
+    kv::TaskId task;
+    auto submitted = sdk_->StoreAsync(entries, task);
     if (!submitted.ok()) return tl::unexpected(ToError(submitted));
-    task->sdk_task = sdk_task;
-    task->uses_memory = true;
     ++active_loads_;  // Shared registration lifetime counter for reads/writes.
-    auto handle = task.get();
-    std::lock_guard task_lock(tasks_mutex_);
-    write_tasks_.emplace(handle, std::move(task));
-    return static_cast<void*>(handle);
+    return SaveStoreTask(task, std::move(indices), std::move(results));
 }
 
 tl::expected<void*, ErrorCode> KvClientBackend::BatchPut(
@@ -404,92 +431,55 @@ tl::expected<void*, ErrorCode> KvClientBackend::BatchPut(
     if (keys.size() != batched_slices.size())
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     std::unique_lock memory_lock(memory_mutex_);
-    auto task = std::make_unique<WriteTask>();
-    auto entries = BuildStoreEntries(tenant_id, keys, batched_slices, *task);
-    if (!entries.empty()) {
-        kv::TaskId sdk_task;
-        auto submitted = sdk_->BatchStoreAsync(entries, sdk_task);
-        if (!submitted.ok()) return tl::unexpected(ToError(submitted));
-        task->sdk_task = sdk_task;
-        task->uses_memory = true;
-        ++active_loads_;
+    std::vector<size_t> indices;
+    std::vector<tl::expected<void, ErrorCode>> results;
+    auto entries =
+        BuildStoreEntries(tenant_id, keys, batched_slices, indices, results);
+    if (entries.empty()) {
+        return SaveTask([results = std::move(results)]() mutable {
+            return std::move(results);
+        });
     }
-    auto handle = task.get();
-    std::lock_guard task_lock(tasks_mutex_);
-    write_tasks_.emplace(handle, std::move(task));
-    return static_cast<void*>(handle);
+    kv::TaskId task;
+    auto submitted = sdk_->BatchStoreAsync(entries, task);
+    if (!submitted.ok()) return tl::unexpected(ToError(submitted));
+    ++active_loads_;
+    return SaveStoreTask(task, std::move(indices), std::move(results));
 }
 
 tl::expected<void*, ErrorCode> KvClientBackend::Remove(
     const TenantId& tenant_id, const ObjectKey& key) {
-    auto task = std::make_unique<WriteTask>();
-    task->results.resize(1);
-    task->indices.push_back(0);
-    kv::TaskId sdk_task;
-    auto submitted = sdk_->DeleteAsync({EncodeKey(key, tenant_id)}, sdk_task);
+    kv::TaskId task;
+    auto submitted = sdk_->DeleteAsync({EncodeKey(key, tenant_id)}, task);
     if (!submitted.ok()) return tl::unexpected(ToError(submitted));
-    task->sdk_task = sdk_task;
-    auto handle = task.get();
-    std::lock_guard lock(tasks_mutex_);
-    write_tasks_.emplace(handle, std::move(task));
-    return static_cast<void*>(handle);
+    return SaveTask([this, task] {
+        return WaitForWrite(task, {0},
+                            std::vector<tl::expected<void, ErrorCode>>(1));
+    });
 }
 
 tl::expected<void*, ErrorCode> KvClientBackend::BatchRemove(
     const TenantId& tenant_id, const std::vector<ObjectKey>& keys) {
-    auto task = std::make_unique<WriteTask>();
-    task->results.resize(keys.size());
+    if (keys.empty()) {
+        return SaveTask(
+            [] { return std::vector<tl::expected<void, ErrorCode>>{}; });
+    }
     std::vector<kv::CacheKey> sdk_keys;
+    std::vector<size_t> indices;
     sdk_keys.reserve(keys.size());
+    indices.reserve(keys.size());
     for (size_t i = 0; i < keys.size(); ++i) {
         sdk_keys.push_back(EncodeKey(keys[i], tenant_id));
-        task->indices.push_back(i);
+        indices.push_back(i);
     }
-    if (!sdk_keys.empty()) {
-        kv::TaskId sdk_task;
-        auto submitted = sdk_->DeleteAsync(sdk_keys, sdk_task);
-        if (!submitted.ok()) return tl::unexpected(ToError(submitted));
-        task->sdk_task = sdk_task;
-    }
-    auto handle = task.get();
-    std::lock_guard lock(tasks_mutex_);
-    write_tasks_.emplace(handle, std::move(task));
-    return static_cast<void*>(handle);
-}
-
-std::vector<tl::expected<void, ErrorCode>> KvClientBackend::Wait(
-    void* handle, uint64_t timeout_ms) {
-    std::unique_ptr<WriteTask> task;
-    {
-        std::lock_guard lock(tasks_mutex_);
-        auto it = write_tasks_.find(handle);
-        if (it == write_tasks_.end())
-            return {tl::unexpected(ErrorCode::INVALID_PARAMS)};
-        task = std::move(it->second);
-        write_tasks_.erase(it);
-    }
-    if (task->sdk_task) {
-        kv::TaskResult result;
-        const auto waited = sdk_->Wait(*task->sdk_task, timeout_ms, result);
-        const auto& status = waited.ok() ? result.status : waited;
-        const bool has_entries =
-            (status.ok() || status.code == kv::StatusCode::PARTIAL_FAILED) &&
-            result.entryStatus.size() == task->indices.size();
-        for (size_t j = 0; j < task->indices.size(); ++j) {
-            const auto error =
-                ToError(has_entries ? result.entryStatus[j] : status);
-            auto& item = task->results[task->indices[j]];
-            if (item && error != ErrorCode::OK) item = tl::unexpected(error);
-        }
-    }
-    if (task->uses_memory) {
-        {
-            std::lock_guard lock(memory_mutex_);
-            --active_loads_;
-        }
-        memory_idle_.notify_all();
-    }
-    return std::move(task->results);
+    kv::TaskId task;
+    auto submitted = sdk_->DeleteAsync(sdk_keys, task);
+    if (!submitted.ok()) return tl::unexpected(ToError(submitted));
+    return SaveTask([this, task, indices = std::move(indices)] {
+        return WaitForWrite(
+            task, indices,
+            std::vector<tl::expected<void, ErrorCode>>(indices.size()));
+    });
 }
 
 }  // namespace mooncake
