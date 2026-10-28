@@ -2024,39 +2024,40 @@ bool Client::RedirectToHotCache(const std::string& key,
     return true;
 }
 
-std::vector<tl::expected<void, ErrorCode>> Client::WaitExternal(
-    const tl::expected<void*, ErrorCode>& submission) {
-    if (!submission) {
-        LOG(WARNING) << "External store submission failed: "
-                     << submission.error();
-        return {};
-    }
-    if (!*submission) return {};
-    auto results = external_store_backend_->Wait(*submission);
-    for (size_t i = 0; i < results.size(); ++i) {
-        if (!results[i]) {
-            LOG(WARNING) << "External store operation failed at index=" << i
-                         << ": " << results[i].error();
-        }
-    }
-    return results;
-}
-
 tl::expected<void, ErrorCode> Client::FinishExternalPut(
     const tl::expected<void*, ErrorCode>& submission,
     tl::expected<void, ErrorCode> native_result) {
-    auto external = WaitExternal(submission);
-    if (external.size() == 1 && external.front()) return {};
+    if (!submission) {
+        LOG(WARNING) << "External store submission failed: "
+                     << submission.error();
+        return native_result;
+    }
+    if (!*submission) return native_result;
+    auto external = WaitExternal(*submission);
+    if (external.size() == 1) {
+        if (external.front()) return {};
+        LOG(WARNING) << "External store operation failed: "
+                     << external.front().error();
+    }
     return native_result;
 }
 
 std::vector<tl::expected<void, ErrorCode>> Client::FinishExternalPut(
     const tl::expected<void*, ErrorCode>& submission,
     std::vector<tl::expected<void, ErrorCode>> native_results) {
-    auto external = WaitExternal(submission);
-    if (external.size() == native_results.size()) {
-        for (size_t i = 0; i < external.size(); ++i) {
-            if (external[i]) native_results[i] = {};
+    if (!submission) {
+        LOG(WARNING) << "External store submission failed: "
+                     << submission.error();
+        return native_results;
+    }
+    if (!*submission) return native_results;
+    auto external = WaitExternal(*submission);
+    for (size_t i = 0; i < external.size(); ++i) {
+        if (!external[i]) {
+            LOG(WARNING) << "External store operation failed at index=" << i
+                         << ": " << external[i].error();
+        } else if (external.size() == native_results.size()) {
+            native_results[i] = {};
         }
     }
     return native_results;
@@ -3847,7 +3848,18 @@ tl::expected<void, ErrorCode> Client::Remove(const ObjectKey& key, bool force) {
     }
 
     auto result = master_client_.Remove(key, force);
-    (void)WaitExternal(external);
+    if (!external) {
+        LOG(WARNING) << "External delete submission failed: "
+                     << external.error();
+    } else if (*external) {
+        auto external_results = WaitExternal(*external);
+        for (size_t i = 0; i < external_results.size(); ++i) {
+            if (!external_results[i]) {
+                LOG(WARNING) << "External delete failed at index=" << i << ": "
+                             << external_results[i].error();
+            }
+        }
+    }
     // if (storage_backend_) {
     //     storage_backend_->RemoveFile(key);
     // }
@@ -3909,7 +3921,18 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchRemove(
     }
 
     auto results = master_client_.BatchRemove(keys, force);
-    (void)WaitExternal(external);
+    if (!external) {
+        LOG(WARNING) << "External delete submission failed: "
+                     << external.error();
+    } else if (*external) {
+        auto external_results = WaitExternal(*external);
+        for (size_t i = 0; i < external_results.size(); ++i) {
+            if (!external_results[i]) {
+                LOG(WARNING) << "External delete failed at index=" << i << ": "
+                             << external_results[i].error();
+            }
+        }
+    }
 
     if (hot_cache_) {
         std::vector<std::string> removed_keys;
