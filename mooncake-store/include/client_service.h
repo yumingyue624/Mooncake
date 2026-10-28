@@ -827,6 +827,7 @@ class Client {
 
    private:
     friend class RealClient;
+    void FinishExternalRemove(const tl::expected<void*, ErrorCode>& submission);
     tl::expected<void, ErrorCode> FinishExternalPut(
         const tl::expected<void*, ErrorCode>& submission,
         tl::expected<void, ErrorCode> native_result);
