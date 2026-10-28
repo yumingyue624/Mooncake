@@ -1,5 +1,7 @@
 #include "storage/kvclient_backend.h"
 
+#include <algorithm>
+#include <charconv>
 #include <cstring>
 #include <functional>
 #include <iterator>
@@ -99,9 +101,43 @@ tl::expected<void, ErrorCode> KvClientBackend::Init(
     if (config == options.end()) {
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
+    LayoutConfig layout;
+    const std::pair<const char*, uint64_t*> fields[] = {
+        {"pp_size", &layout.pp_size},
+        {"pcp_size", &layout.pcp_size},
+        {"dcp_size", &layout.dcp_size},
+        {"layer_slots", &layout.layer_slots},
+        {"kv_group_slots", &layout.kv_group_slots},
+        {"group_slot_bytes", &layout.group_slot_bytes},
+    };
+    // Existing SDK-only configurations remain valid. A layout, when supplied,
+    // must specify every dimension shared by all writers of an object.
+    const bool has_layout = std::any_of(
+        std::begin(fields), std::end(fields),
+        [&](const auto& field) { return options.contains(field.first); });
+    if (has_layout) {
+        layout.object_capacity = 1;
+        for (const auto& [name, value] : fields) {
+            const auto it = options.find(name);
+            if (it == options.end())
+                return tl::unexpected(ErrorCode::INVALID_PARAMS);
+            const auto& text = it->second;
+            const auto [end, error] =
+                std::from_chars(text.data(), text.data() + text.size(), *value);
+            if (error != std::errc{} || end != text.data() + text.size() ||
+                *value == 0 ||
+                layout.object_capacity >
+                    std::numeric_limits<uint64_t>::max() / *value)
+                return tl::unexpected(ErrorCode::INVALID_PARAMS);
+            layout.object_capacity *= *value;
+        }
+        if (layout.group_slot_bytes % 512 != 0)
+            return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
     sdk_ = kv::CreateKvClient();
     auto status = sdk_->Init(config->second);
     if (!status.ok()) return tl::unexpected(ToError(status));
+    layout_ = has_layout ? std::optional<LayoutConfig>{layout} : std::nullopt;
     return {};
 }
 

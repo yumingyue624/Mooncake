@@ -4,6 +4,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <unordered_set>
 #include <utility>
 
@@ -51,6 +52,16 @@ class KvClientBackend final : public ExternalStoreBackend {
     tl::expected<void, ErrorCode> UnregisterMemory(void* addr) override;
 
    private:
+    struct LayoutConfig {
+        uint64_t pp_size = 0;
+        uint64_t pcp_size = 0;
+        uint64_t dcp_size = 0;
+        uint64_t layer_slots = 0;
+        uint64_t kv_group_slots = 0;
+        uint64_t group_slot_bytes = 0;
+        uint64_t object_capacity = 0;
+    };
+    std::optional<LayoutConfig> layout_;
     std::vector<kv::KVBuffer> BuildStoreEntries(
         const TenantId& tenant_id, const std::vector<ObjectKey>& keys,
         const std::vector<std::vector<Slice>>& batched_slices,
