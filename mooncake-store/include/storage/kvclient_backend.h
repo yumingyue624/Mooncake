@@ -61,6 +61,9 @@ class KvClientBackend final : public ExternalStoreBackend {
         uint64_t group_slot_bytes = 0;
         uint64_t object_capacity = 0;
     };
+    static tl::expected<std::optional<LayoutConfig>, ErrorCode>
+    ParseLayoutConfig(
+        const std::unordered_map<std::string, std::string>& options);
     std::optional<LayoutConfig> layout_;
     std::vector<kv::KVBuffer> BuildStoreEntries(
         const TenantId& tenant_id, const std::vector<ObjectKey>& keys,
