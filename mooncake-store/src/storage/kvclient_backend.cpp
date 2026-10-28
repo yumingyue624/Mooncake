@@ -366,8 +366,7 @@ std::vector<kv::KVBuffer> KvClientBackend::BuildStoreEntries(
     const std::vector<std::vector<Slice>>& batched_slices,
     std::vector<size_t>& indices,
     std::vector<tl::expected<void, ErrorCode>>& results) {
-    // The caller holds memory_mutex_; registrations also remain pinned until
-    // the submitted task has been collected by Wait.
+    // The caller holds memory_mutex_.
     std::vector<kv::KVBuffer> entries;
     results.resize(keys.size());
     for (size_t i = 0; i < keys.size(); ++i) {
@@ -430,21 +429,6 @@ std::vector<tl::expected<void, ErrorCode>> KvClientBackend::WaitForWrite(
     return results;
 }
 
-ExternalStoreBackend::TaskHandle KvClientBackend::SaveStoreTask(
-    kv::TaskId task, std::vector<size_t> indices,
-    std::vector<tl::expected<void, ErrorCode>> results) {
-    return SaveTask([this, task, indices = std::move(indices),
-                     results = std::move(results)]() mutable {
-        auto completed = WaitForWrite(task, indices, std::move(results));
-        {
-            std::lock_guard lock(memory_mutex_);
-            --active_loads_;
-        }
-        memory_idle_.notify_all();
-        return completed;
-    });
-}
-
 tl::expected<void*, ErrorCode> KvClientBackend::Put(
     const TenantId& tenant_id, const ObjectKey& key,
     const std::vector<Slice>& slices) {
@@ -457,8 +441,10 @@ tl::expected<void*, ErrorCode> KvClientBackend::Put(
     kv::TaskId task;
     auto submitted = sdk_->StoreAsync(entries, task);
     if (!submitted.ok()) return tl::unexpected(ToError(submitted));
-    ++active_loads_;  // Shared registration lifetime counter for reads/writes.
-    return SaveStoreTask(task, std::move(indices), std::move(results));
+    return SaveTask([this, task, indices = std::move(indices),
+                     results = std::move(results)]() mutable {
+        return WaitForWrite(task, indices, std::move(results));
+    });
 }
 
 tl::expected<void*, ErrorCode> KvClientBackend::BatchPut(
@@ -479,8 +465,10 @@ tl::expected<void*, ErrorCode> KvClientBackend::BatchPut(
     kv::TaskId task;
     auto submitted = sdk_->BatchStoreAsync(entries, task);
     if (!submitted.ok()) return tl::unexpected(ToError(submitted));
-    ++active_loads_;
-    return SaveStoreTask(task, std::move(indices), std::move(results));
+    return SaveTask([this, task, indices = std::move(indices),
+                     results = std::move(results)]() mutable {
+        return WaitForWrite(task, indices, std::move(results));
+    });
 }
 
 tl::expected<void*, ErrorCode> KvClientBackend::Remove(

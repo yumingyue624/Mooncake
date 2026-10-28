@@ -70,9 +70,6 @@ class KvClientBackend final : public ExternalStoreBackend {
     std::vector<tl::expected<void, ErrorCode>> WaitForWrite(
         kv::TaskId task, const std::vector<size_t>& indices,
         std::vector<tl::expected<void, ErrorCode>> results);
-    TaskHandle SaveStoreTask(
-        kv::TaskId task, std::vector<size_t> indices,
-        std::vector<tl::expected<void, ErrorCode>> results);
     kv::CacheKey EncodeKey(const ObjectKey& key, const TenantId& tenant_id);
     kv::TaskResult WaitForCompletion(kv::TaskId task);
     tl::expected<TaskHandle, ErrorCode> SubmitLoads(
