@@ -479,3 +479,8 @@ foreach(
 endforeach()
 
 add_store_test(master_heartbeat_metric_test master_heartbeat_metric_test.cpp)
+
+if(STORE_USE_KVCLIENT)
+  add_store_test(kvclient_write_test kvclient_write_test.cpp)
+  target_link_libraries(kvclient_write_test PRIVATE Mooncake::xxhash)
+endif()
