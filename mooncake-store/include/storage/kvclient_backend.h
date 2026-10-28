@@ -19,6 +19,20 @@ class KvClientBackend final : public ExternalStoreBackend {
     tl::expected<void, ErrorCode> Init(
         const std::unordered_map<std::string, std::string>& options) override;
     tl::expected<void, ErrorCode> Shutdown() override;
+    tl::expected<void*, ErrorCode> Put(
+        const TenantId& tenant_id, const ObjectKey& key,
+        const std::vector<Slice>& slices) override;
+    tl::expected<void*, ErrorCode> BatchPut(
+        const TenantId& tenant_id, const std::vector<ObjectKey>& keys,
+        const std::vector<std::vector<Slice>>& batched_slices) override;
+    tl::expected<void*, ErrorCode> Remove(const TenantId& tenant_id,
+                                          const ObjectKey& key) override;
+    tl::expected<void*, ErrorCode> BatchRemove(
+        const TenantId& tenant_id, const std::vector<ObjectKey>& keys) override;
+    // Consumes the task once and returns one result per input key, in order.
+    std::vector<tl::expected<void, ErrorCode>> Wait(
+        void* task, uint64_t timeout_ms) override;
+
     tl::expected<TaskHandle, ErrorCode> BatchExistsAsync(
         const std::vector<ObjectKey>& keys, const TenantId& tenant_id,
         std::vector<uint8_t>* exists) override;
@@ -40,6 +54,17 @@ class KvClientBackend final : public ExternalStoreBackend {
     tl::expected<void, ErrorCode> UnregisterMemory(void* addr) override;
 
    private:
+    friend class KvClientBackendTestPeer;
+    struct WriteTask {
+        std::optional<kv::TaskId> sdk_task;
+        std::vector<size_t> indices;
+        std::vector<tl::expected<void, ErrorCode>> results;
+        bool uses_memory = false;
+    };
+    std::vector<kv::KVBuffer> BuildStoreEntries(
+        const TenantId& tenant_id, const std::vector<ObjectKey>& keys,
+        const std::vector<std::vector<Slice>>& batched_slices, WriteTask& task);
+    std::map<void*, std::unique_ptr<WriteTask>> write_tasks_;
     kv::CacheKey EncodeKey(const ObjectKey& key, const TenantId& tenant_id);
     kv::TaskResult WaitForCompletion(kv::TaskId task);
     tl::expected<TaskHandle, ErrorCode> SubmitLoads(
