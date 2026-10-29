@@ -230,9 +230,9 @@ KvClientBackend::ParseLayoutConfig(
         {"pp_size", &layout.pp_size},
         {"pcp_size", &layout.pcp_size},
         {"dcp_size", &layout.dcp_size},
-        {"layer_slots", &layout.layer_slots},
-        {"kv_group_slots", &layout.kv_group_slots},
-        {"group_slot_bytes", &layout.group_slot_bytes},
+        {"layer_count", &layout.layer_count},
+        {"head_or_tp_size", &layout.head_or_tp_size},
+        {"shard_bytes", &layout.shard_bytes},
     };
     // Existing SDK-only configurations remain valid. A layout, when supplied,
     // must specify every dimension shared by all writers of an object.
@@ -254,7 +254,7 @@ KvClientBackend::ParseLayoutConfig(
                 return tl::unexpected(ErrorCode::INVALID_PARAMS);
             object_capacity *= *value;
         }
-        if (layout.group_slot_bytes % 512 != 0)
+        if (layout.shard_bytes % 512 != 0)
             return tl::unexpected(ErrorCode::INVALID_PARAMS);
         if (layout.pp_size != 1 ||
             object_capacity >
@@ -493,12 +493,12 @@ KvClientBackend::ResolveStoreLayout(const ObjectKey& key,
     if ((!parsed->has_pp_rank && layout_->pp_size != 1) ||
         (!parsed->has_pcp_rank && layout_->pcp_size != 1) ||
         (!parsed->has_dcp_rank && layout_->dcp_size != 1) ||
-        (!parsed->has_head_or_tp_rank && layout_->kv_group_slots != 1) ||
+        (!parsed->has_head_or_tp_rank && layout_->head_or_tp_size != 1) ||
         parsed->pp_rank >= layout_->pp_size ||
         parsed->pcp_rank >= layout_->pcp_size ||
         parsed->dcp_rank >= layout_->dcp_size ||
-        parsed->head_or_tp_rank >= layout_->kv_group_slots ||
-        (parsed->layer && *parsed->layer >= layout_->layer_slots))
+        parsed->head_or_tp_rank >= layout_->head_or_tp_size ||
+        (parsed->layer && *parsed->layer >= layout_->layer_count))
         return tl::unexpected(ErrorCode::INVALID_KEY);
     uint64_t layer_bytes = 0;
     for (const auto& slice : slices) {
@@ -506,25 +506,25 @@ KvClientBackend::ResolveStoreLayout(const ObjectKey& key,
             return tl::unexpected(ErrorCode::INVALID_PARAMS);
         layer_bytes += slice.size;
     }
-    // PP=1: non-layerwise inputs contain layer_slots equal-sized layers.
-    const auto layers = parsed->layer ? uint64_t{1} : layout_->layer_slots;
+    // PP=1: non-layerwise inputs contain layer_count equal-sized layers.
+    const auto layers = parsed->layer ? uint64_t{1} : layout_->layer_count;
     if (layer_bytes == 0 || layer_bytes % layers != 0)
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     layer_bytes /= layers;
-    if (layer_bytes > layout_->group_slot_bytes || layer_bytes % 512 != 0)
+    if (layer_bytes > layout_->shard_bytes || layer_bytes % 512 != 0)
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     const auto base_offset =
         ((((parsed->pp_rank * layout_->pcp_size + parsed->pcp_rank) *
                layout_->dcp_size +
            parsed->dcp_rank) *
-              layout_->layer_slots +
+              layout_->layer_count +
           parsed->layer.value_or(0)) *
-             layout_->kv_group_slots +
+             layout_->head_or_tp_size +
          parsed->head_or_tp_rank) *
-        layout_->group_slot_bytes;
+        layout_->shard_bytes;
     return std::optional<StoreLayout>{
         StoreLayout{base_offset, layer_bytes,
-                    layout_->kv_group_slots * layout_->group_slot_bytes}};
+                    layout_->head_or_tp_size * layout_->shard_bytes}};
 }
 
 tl::expected<const kv::RegisteredMemory*, ErrorCode>
