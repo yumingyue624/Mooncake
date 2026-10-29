@@ -14,9 +14,8 @@
 #include "device/accelerator_registry.h"
 
 namespace mooncake {
-namespace {
 
-struct VllmKey {
+struct KvClientBackend::VllmKey {
     std::string_view model_name;
     std::string_view chunk_hash;
     std::string storage_key;
@@ -30,6 +29,8 @@ struct VllmKey {
     bool has_dcp_rank = false;
     bool has_head_or_tp_rank = false;
 };
+
+namespace {
 
 bool ParseRankValue(std::string_view text, uint64_t& value) {
     const auto [end, error] =
@@ -52,7 +53,10 @@ std::pair<std::string_view, std::string_view> SplitKeyField(
     return {field, {}};
 }
 
-tl::expected<VllmKey, ErrorCode> ParseVllmKey(std::string_view key) {
+}  // namespace
+
+tl::expected<KvClientBackend::VllmKey, ErrorCode> KvClientBackend::ParseVllmKey(
+    std::string_view key) {
     VllmKey parsed;
     const auto first = key.find('@');
     if (first == std::string_view::npos || first == 0)
@@ -121,6 +125,8 @@ tl::expected<VllmKey, ErrorCode> ParseVllmKey(std::string_view key) {
     return parsed;
 }
 
+namespace {
+
 ErrorCode ToError(const kv::Status& status) {
     switch (status.code) {
         case kv::StatusCode::OK:
@@ -154,14 +160,24 @@ ErrorCode ToError(const kv::Status& status) {
 
 }  // namespace
 
-kv::CacheKey KvClientBackend::EncodeKey(const ObjectKey& key,
-                                        const TenantId& tenant_id) {
+tl::expected<kv::CacheKey, ErrorCode> KvClientBackend::EncodeKey(
+    const ObjectKey& key, const TenantId& tenant_id, VllmKey* parsed_key) {
     std::string identity = key;
     if (layout_) {
         auto parsed = ParseVllmKey(key);
-        if (parsed) {
-            identity = parsed->storage_key;
-        }
+        if (!parsed) return tl::unexpected(parsed.error());
+        if ((!parsed->has_pp_rank && layout_->pp_size != 1) ||
+            (!parsed->has_pcp_rank && layout_->pcp_size != 1) ||
+            (!parsed->has_dcp_rank && layout_->dcp_size != 1) ||
+            (!parsed->has_head_or_tp_rank && layout_->head_or_tp_size != 1) ||
+            parsed->pp_rank >= layout_->pp_size ||
+            parsed->pcp_rank >= layout_->pcp_size ||
+            parsed->dcp_rank >= layout_->dcp_size ||
+            parsed->head_or_tp_rank >= layout_->head_or_tp_size ||
+            (parsed->layer && *parsed->layer >= layout_->layer_count))
+            return tl::unexpected(ErrorCode::INVALID_KEY);
+        identity = parsed->storage_key;
+        if (parsed_key) *parsed_key = std::move(*parsed);
     }
     const auto scoped_key = tenant_id.MakeScopedKey(identity);
     const uint64_t hash = XXH64(scoped_key.data(), scoped_key.size(), 0);
@@ -329,30 +345,49 @@ KvClientBackend::BatchExistsAsync(const std::vector<ObjectKey>& keys,
         });
     }
     std::vector<kv::CacheKey> sdk_keys;
-    for (const auto& key : keys) sdk_keys.push_back(EncodeKey(key, tenant_id));
+    std::vector<size_t> indices;
+    std::vector<tl::expected<void, ErrorCode>> results(keys.size());
+    sdk_keys.reserve(keys.size());
+    indices.reserve(keys.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        auto key = EncodeKey(keys[i], tenant_id);
+        if (!key) {
+            results[i] = tl::unexpected(key.error());
+            continue;
+        }
+        sdk_keys.push_back(*key);
+        indices.push_back(i);
+    }
+    if (sdk_keys.empty()) {
+        return SaveTask([exists, results = std::move(results)]() mutable {
+            exists->assign(results.size(), 0);
+            return std::move(results);
+        });
+    }
     kv::TaskId task;
     auto submitted = sdk_->QueryAsync(sdk_keys, task);
     if (!submitted.ok()) return tl::unexpected(ToError(submitted));
-    return SaveTask([this, task, exists, count = keys.size()] {
+    return SaveTask([this, task, exists, indices = std::move(indices),
+                     results = std::move(results)]() mutable {
         auto completed = WaitForCompletion(task);
-        std::vector<tl::expected<void, ErrorCode>> results(count);
-        exists->assign(count, 0);
-        for (size_t j = 0; j < count; ++j) {
+        exists->assign(results.size(), 0);
+        for (size_t j = 0; j < indices.size(); ++j) {
+            const auto index = indices[j];
             const auto& status = completed.entryStatus.empty()
                                      ? completed.status
                                      : completed.entryStatus[j];
             if (status.code == kv::StatusCode::ENTRY_KEY_EXIST) {
-                (*exists)[j] = 1;
+                (*exists)[index] = 1;
             } else if (ToError(status) == ErrorCode::OBJECT_NOT_FOUND &&
                        !status.ok()) {
-                (*exists)[j] = 0;
+                (*exists)[index] = 0;
             } else if (!status.ok()) {
-                results[j] = tl::unexpected(ToError(status));
+                results[index] = tl::unexpected(ToError(status));
             } else {
-                (*exists)[j] = completed.queryResult->exists[j] != 0;
+                (*exists)[index] = completed.queryResult->exists[j] != 0;
             }
         }
-        return results;
+        return std::move(results);
     });
 }
 
@@ -402,12 +437,13 @@ KvClientBackend::SubmitLoads(
     std::vector<size_t> lengths;
     auto runtime = device::GetAcceleratorRegistry().RuntimeAccelerators();
     for (size_t i = 0; i < keys.size(); ++i) {
-        auto layout = ResolveStoreLayout(keys[i]);
-        if (!layout) {
-            results[i] = tl::unexpected(layout.error());
+        VllmKey parsed;
+        auto key = EncodeKey(keys[i], tenant_id, &parsed);
+        if (!key) {
+            results[i] = tl::unexpected(key.error());
             continue;
         }
-        const auto key = EncodeKey(keys[i], tenant_id);
+        const auto layout = ResolveStoreLayout(parsed);
         std::vector<kv::KVBuffer> object_entries;
         if (targets[i].empty()) {
             results[i] = tl::unexpected(ErrorCode::INVALID_PARAMS);
@@ -416,13 +452,13 @@ KvClientBackend::SubmitLoads(
         for (size_t j = 0; j < targets[i].size(); ++j) {
             const auto& slice = targets[i][j];
             uint64_t object_offset = source_offsets[i][j];
-            if (*layout) {
-                if (object_offset > (*layout)->capacity ||
-                    slice.size > (*layout)->capacity - object_offset) {
+            if (layout) {
+                if (object_offset > layout->capacity ||
+                    slice.size > layout->capacity - object_offset) {
                     results[i] = tl::unexpected(ErrorCode::INVALID_PARAMS);
                     break;
                 }
-                object_offset += (*layout)->base_offset;
+                object_offset += layout->base_offset;
             }
             device::PointerInfo info{.kind = device::MemoryKind::kHost,
                                      .device_id = -1};
@@ -451,7 +487,7 @@ KvClientBackend::SubmitLoads(
                 break;
             }
             kv::KVBuffer entry{};
-            entry.key = key;
+            entry.key = *key;
             entry.buffer.region = registered.region;
             entry.buffer.handle = registered.handle;
             entry.buffer.region.addr = addr;
@@ -497,29 +533,17 @@ KvClientBackend::SubmitLoads(
     });
 }
 
-tl::expected<std::optional<KvClientBackend::StoreLayout>, ErrorCode>
-KvClientBackend::ResolveStoreLayout(const ObjectKey& key) const {
-    if (!layout_) return std::optional<StoreLayout>{};
-    auto parsed = ParseVllmKey(key);
-    if (!parsed) return tl::unexpected(parsed.error());
-    if ((!parsed->has_pp_rank && layout_->pp_size != 1) ||
-        (!parsed->has_pcp_rank && layout_->pcp_size != 1) ||
-        (!parsed->has_dcp_rank && layout_->dcp_size != 1) ||
-        (!parsed->has_head_or_tp_rank && layout_->head_or_tp_size != 1) ||
-        parsed->pp_rank >= layout_->pp_size ||
-        parsed->pcp_rank >= layout_->pcp_size ||
-        parsed->dcp_rank >= layout_->dcp_size ||
-        parsed->head_or_tp_rank >= layout_->head_or_tp_size ||
-        (parsed->layer && *parsed->layer >= layout_->layer_count))
-        return tl::unexpected(ErrorCode::INVALID_KEY);
-    const auto rank = (parsed->pp_rank * layout_->pcp_size + parsed->pcp_rank) *
+std::optional<KvClientBackend::StoreLayout> KvClientBackend::ResolveStoreLayout(
+    const VllmKey& parsed) const {
+    if (!layout_) return std::nullopt;
+    const auto rank = (parsed.pp_rank * layout_->pcp_size + parsed.pcp_rank) *
                           layout_->dcp_size +
-                      parsed->dcp_rank;
-    if (parsed->layer) {
+                      parsed.dcp_rank;
+    if (parsed.layer) {
         const auto base_offset =
-            ((rank * layout_->layer_count + *parsed->layer) *
+            ((rank * layout_->layer_count + *parsed.layer) *
                  layout_->head_or_tp_size +
-             parsed->head_or_tp_rank) *
+             parsed.head_or_tp_rank) *
             layout_->shard_bytes;
         return std::optional<StoreLayout>{
             StoreLayout{base_offset, layout_->shard_bytes}};
@@ -527,7 +551,7 @@ KvClientBackend::ResolveStoreLayout(const ObjectKey& key) const {
     // A non-layerwise key occupies one contiguous slot for all its slices.
     const auto capacity = layout_->layer_count * layout_->shard_bytes;
     const auto base_offset =
-        (rank * layout_->head_or_tp_size + parsed->head_or_tp_rank) * capacity;
+        (rank * layout_->head_or_tp_size + parsed.head_or_tp_rank) * capacity;
     return std::optional<StoreLayout>{StoreLayout{base_offset, capacity}};
 }
 
@@ -595,14 +619,16 @@ std::vector<kv::KVBuffer> KvClientBackend::BuildStoreEntries(
     std::vector<kv::KVBuffer> entries;
     results.resize(keys.size());
     for (size_t i = 0; i < keys.size(); ++i) {
-        auto layout = ResolveStoreLayout(keys[i]);
-        if (!layout) {
-            results[i] = tl::unexpected(layout.error());
+        VllmKey parsed;
+        auto key = EncodeKey(keys[i], tenant_id, &parsed);
+        if (!key) {
+            results[i] = tl::unexpected(key.error());
             continue;
         }
+        const auto layout = ResolveStoreLayout(parsed);
         const auto begin = entries.size();
-        results[i] = AppendStoreEntries(EncodeKey(keys[i], tenant_id),
-                                        batched_slices[i], *layout, entries);
+        results[i] =
+            AppendStoreEntries(*key, batched_slices[i], layout, entries);
         if (!results[i]) {
             entries.resize(begin);
             continue;
@@ -674,8 +700,10 @@ tl::expected<void*, ErrorCode> KvClientBackend::BatchPutAsync(
 
 tl::expected<void*, ErrorCode> KvClientBackend::RemoveAsync(
     const ObjectKey& key, const TenantId& tenant_id) {
+    auto encoded = EncodeKey(key, tenant_id);
+    if (!encoded) return tl::unexpected(encoded.error());
     kv::TaskId task;
-    auto submitted = sdk_->DeleteAsync({EncodeKey(key, tenant_id)}, task);
+    auto submitted = sdk_->DeleteAsync({*encoded}, task);
     if (!submitted.ok()) return tl::unexpected(ToError(submitted));
     return SaveTask([this, task] {
         return WaitForWrite(task, {0},
@@ -691,19 +719,29 @@ tl::expected<void*, ErrorCode> KvClientBackend::BatchRemoveAsync(
     }
     std::vector<kv::CacheKey> sdk_keys;
     std::vector<size_t> indices;
+    std::vector<tl::expected<void, ErrorCode>> results(keys.size());
     sdk_keys.reserve(keys.size());
     indices.reserve(keys.size());
     for (size_t i = 0; i < keys.size(); ++i) {
-        sdk_keys.push_back(EncodeKey(keys[i], tenant_id));
+        auto key = EncodeKey(keys[i], tenant_id);
+        if (!key) {
+            results[i] = tl::unexpected(key.error());
+            continue;
+        }
+        sdk_keys.push_back(*key);
         indices.push_back(i);
+    }
+    if (sdk_keys.empty()) {
+        return SaveTask([results = std::move(results)]() mutable {
+            return std::move(results);
+        });
     }
     kv::TaskId task;
     auto submitted = sdk_->DeleteAsync(sdk_keys, task);
     if (!submitted.ok()) return tl::unexpected(ToError(submitted));
-    return SaveTask([this, task, indices = std::move(indices)] {
-        return WaitForWrite(
-            task, indices,
-            std::vector<tl::expected<void, ErrorCode>>(indices.size()));
+    return SaveTask([this, task, indices = std::move(indices),
+                     results = std::move(results)]() mutable {
+        return WaitForWrite(task, indices, std::move(results));
     });
 }
 

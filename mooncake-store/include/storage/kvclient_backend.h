@@ -5,6 +5,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <string_view>
 #include <unordered_set>
 #include <utility>
 
@@ -53,6 +54,8 @@ class KvClientBackend final : public ExternalStoreBackend {
     tl::expected<void, ErrorCode> UnregisterMemory(void* addr) override;
 
    private:
+    struct VllmKey;
+    static tl::expected<VllmKey, ErrorCode> ParseVllmKey(std::string_view key);
     struct LayoutConfig {
         uint64_t pp_size = 0;
         uint64_t pcp_size = 0;
@@ -69,8 +72,7 @@ class KvClientBackend final : public ExternalStoreBackend {
         uint64_t base_offset;
         uint64_t capacity;
     };
-    tl::expected<std::optional<StoreLayout>, ErrorCode> ResolveStoreLayout(
-        const ObjectKey& key) const;
+    std::optional<StoreLayout> ResolveStoreLayout(const VllmKey& parsed) const;
     tl::expected<const kv::RegisteredMemory*, ErrorCode> FindRegisteredMemory(
         const Slice& slice) const;
     tl::expected<void, ErrorCode> AppendStoreEntries(
@@ -85,7 +87,9 @@ class KvClientBackend final : public ExternalStoreBackend {
     std::vector<tl::expected<void, ErrorCode>> WaitForWrite(
         kv::TaskId task, const std::vector<size_t>& indices,
         std::vector<tl::expected<void, ErrorCode>> results);
-    kv::CacheKey EncodeKey(const ObjectKey& key, const TenantId& tenant_id);
+    tl::expected<kv::CacheKey, ErrorCode> EncodeKey(
+        const ObjectKey& key, const TenantId& tenant_id,
+        VllmKey* parsed_key = nullptr);
     kv::TaskResult WaitForCompletion(kv::TaskId task);
     tl::expected<TaskHandle, ErrorCode> SubmitLoads(
         const std::vector<ObjectKey>& keys,
