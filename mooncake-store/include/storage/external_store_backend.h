@@ -24,16 +24,16 @@ class ExternalStoreBackend {
     // Call after client operations stop. Drain tasks and release backend
     // resources, including registered memory. Repeated shutdown is safe.
     virtual tl::expected<void, ErrorCode> Shutdown() = 0;
-    virtual tl::expected<void*, ErrorCode> PutAsync(
+    virtual tl::expected<TaskHandle, ErrorCode> PutAsync(
         const ObjectKey& key, const std::vector<Slice>& slices,
         const TenantId& tenant_id) = 0;
-    virtual tl::expected<void*, ErrorCode> BatchPutAsync(
+    virtual tl::expected<TaskHandle, ErrorCode> BatchPutAsync(
         const std::vector<ObjectKey>& keys,
         const std::vector<std::vector<Slice>>& batched_slices,
         const TenantId& tenant_id) = 0;
-    virtual tl::expected<void*, ErrorCode> RemoveAsync(
+    virtual tl::expected<TaskHandle, ErrorCode> RemoveAsync(
         const ObjectKey& key, const TenantId& tenant_id) = 0;
-    virtual tl::expected<void*, ErrorCode> BatchRemoveAsync(
+    virtual tl::expected<TaskHandle, ErrorCode> BatchRemoveAsync(
         const std::vector<ObjectKey>& keys, const TenantId& tenant_id) = 0;
 
     // exists is non-null and stays valid until Wait returns.

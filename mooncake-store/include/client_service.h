@@ -827,12 +827,16 @@ class Client {
 
    private:
     friend class RealClient;
-    void FinishExternalRemove(const tl::expected<void*, ErrorCode>& submission);
+    void FinishExternalRemove(
+        const tl::expected<ExternalStoreBackend::TaskHandle, ErrorCode>&
+            submission);
     tl::expected<void, ErrorCode> FinishExternalPut(
-        const tl::expected<void*, ErrorCode>& submission,
+        const tl::expected<ExternalStoreBackend::TaskHandle, ErrorCode>&
+            submission,
         tl::expected<void, ErrorCode> native_result);
     std::vector<tl::expected<void, ErrorCode>> FinishExternalPut(
-        const tl::expected<void*, ErrorCode>& submission,
+        const tl::expected<ExternalStoreBackend::TaskHandle, ErrorCode>&
+            submission,
         std::vector<tl::expected<void, ErrorCode>> native_results);
     bool ShouldUseExternal(
         const tl::expected<QueryResult, ErrorCode>& query) const;

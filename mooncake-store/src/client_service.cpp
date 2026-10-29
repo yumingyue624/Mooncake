@@ -2025,7 +2025,7 @@ bool Client::RedirectToHotCache(const std::string& key,
 }
 
 tl::expected<void, ErrorCode> Client::FinishExternalPut(
-    const tl::expected<void*, ErrorCode>& submission,
+    const tl::expected<ExternalStoreBackend::TaskHandle, ErrorCode>& submission,
     tl::expected<void, ErrorCode> native_result) {
     if (!submission) {
         LOG(WARNING) << "External store submission failed: "
@@ -2043,7 +2043,7 @@ tl::expected<void, ErrorCode> Client::FinishExternalPut(
 }
 
 std::vector<tl::expected<void, ErrorCode>> Client::FinishExternalPut(
-    const tl::expected<void*, ErrorCode>& submission,
+    const tl::expected<ExternalStoreBackend::TaskHandle, ErrorCode>& submission,
     std::vector<tl::expected<void, ErrorCode>> native_results) {
     if (!submission) {
         LOG(WARNING) << "External store submission failed: "
@@ -2066,10 +2066,12 @@ std::vector<tl::expected<void, ErrorCode>> Client::FinishExternalPut(
 tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
                                           std::vector<Slice>& slices,
                                           const ReplicateConfig& config) {
-    auto external = external_store_backend_
-                        ? external_store_backend_->PutAsync(
-                              key, slices, TenantId(master_client_.tenant_id()))
-                        : tl::expected<void*, ErrorCode>{nullptr};
+    auto external =
+        external_store_backend_
+            ? external_store_backend_->PutAsync(
+                  key, slices, TenantId(master_client_.tenant_id()))
+            : tl::expected<ExternalStoreBackend::TaskHandle, ErrorCode>{
+                  nullptr};
     std::optional<uint64_t> object_checksum;
     if (object_checksum_enabled_) {
         auto checksum_result = ComputeObjectChecksumForSlices(
@@ -2286,10 +2288,12 @@ bool Client::healDanglingLocalDiskReplica(const ObjectKey& key) {
 tl::expected<void, ErrorCode> Client::Upsert(const ObjectKey& key,
                                              std::vector<Slice>& slices,
                                              const ReplicateConfig& config) {
-    auto external = external_store_backend_
-                        ? external_store_backend_->PutAsync(
-                              key, slices, TenantId(master_client_.tenant_id()))
-                        : tl::expected<void*, ErrorCode>{nullptr};
+    auto external =
+        external_store_backend_
+            ? external_store_backend_->PutAsync(
+                  key, slices, TenantId(master_client_.tenant_id()))
+            : tl::expected<ExternalStoreBackend::TaskHandle, ErrorCode>{
+                  nullptr};
     std::optional<uint64_t> object_checksum;
     if (object_checksum_enabled_) {
         auto checksum_result = ComputeObjectChecksumForSlices(
@@ -2461,7 +2465,8 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchUpsert(
         external_store_backend_
             ? external_store_backend_->BatchPutAsync(
                   keys, batched_slices, TenantId(master_client_.tenant_id()))
-            : tl::expected<void*, ErrorCode>{nullptr};
+            : tl::expected<ExternalStoreBackend::TaskHandle, ErrorCode>{
+                  nullptr};
     ReplicateConfig client_cfg = AttachHostId(config);
     if (protocol_ == "cxl") {
         client_cfg.preferred_segment = local_hostname_;
@@ -3758,7 +3763,8 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPut(
         external_store_backend_
             ? external_store_backend_->BatchPutAsync(
                   keys, batched_slices, TenantId(master_client_.tenant_id()))
-            : tl::expected<void*, ErrorCode>{nullptr};
+            : tl::expected<ExternalStoreBackend::TaskHandle, ErrorCode>{
+                  nullptr};
     ReplicateConfig client_cfg = AttachHostId(config);
     if (protocol_ == "cxl") {
         client_cfg.preferred_segment = local_hostname_;
@@ -3839,7 +3845,8 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPutRevoke(
 }
 
 void Client::FinishExternalRemove(
-    const tl::expected<void*, ErrorCode>& submission) {
+    const tl::expected<ExternalStoreBackend::TaskHandle, ErrorCode>&
+        submission) {
     if (!submission) {
         LOG(WARNING) << "External delete submission failed: "
                      << submission.error();
@@ -3855,10 +3862,12 @@ void Client::FinishExternalRemove(
 }
 
 tl::expected<void, ErrorCode> Client::Remove(const ObjectKey& key, bool force) {
-    auto external = external_store_backend_
-                        ? external_store_backend_->RemoveAsync(
-                              key, TenantId(master_client_.tenant_id()))
-                        : tl::expected<void*, ErrorCode>{nullptr};
+    auto external =
+        external_store_backend_
+            ? external_store_backend_->RemoveAsync(
+                  key, TenantId(master_client_.tenant_id()))
+            : tl::expected<ExternalStoreBackend::TaskHandle, ErrorCode>{
+                  nullptr};
     if (hot_cache_) {
         hot_cache_->BumpKeyGeneration(key);
     }
@@ -3917,10 +3926,12 @@ tl::expected<long, ErrorCode> Client::RemoveAll(bool force) {
 
 std::vector<tl::expected<void, ErrorCode>> Client::BatchRemove(
     const std::vector<ObjectKey>& keys, bool force) {
-    auto external = external_store_backend_
-                        ? external_store_backend_->BatchRemoveAsync(
-                              keys, TenantId(master_client_.tenant_id()))
-                        : tl::expected<void*, ErrorCode>{nullptr};
+    auto external =
+        external_store_backend_
+            ? external_store_backend_->BatchRemoveAsync(
+                  keys, TenantId(master_client_.tenant_id()))
+            : tl::expected<ExternalStoreBackend::TaskHandle, ErrorCode>{
+                  nullptr};
     if (hot_cache_) {
         hot_cache_->BumpKeyGenerations(keys);
     }

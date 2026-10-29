@@ -663,9 +663,10 @@ std::vector<tl::expected<void, ErrorCode>> KvClientBackend::WaitForWrite(
     return results;
 }
 
-tl::expected<void*, ErrorCode> KvClientBackend::PutAsync(
-    const ObjectKey& key, const std::vector<Slice>& slices,
-    const TenantId& tenant_id) {
+tl::expected<ExternalStoreBackend::TaskHandle, ErrorCode>
+KvClientBackend::PutAsync(const ObjectKey& key,
+                          const std::vector<Slice>& slices,
+                          const TenantId& tenant_id) {
     std::unique_lock memory_lock(memory_mutex_);
     std::vector<size_t> indices;
     std::vector<tl::expected<void, ErrorCode>> results;
@@ -681,7 +682,8 @@ tl::expected<void*, ErrorCode> KvClientBackend::PutAsync(
     });
 }
 
-tl::expected<void*, ErrorCode> KvClientBackend::BatchPutAsync(
+tl::expected<ExternalStoreBackend::TaskHandle, ErrorCode>
+KvClientBackend::BatchPutAsync(
     const std::vector<ObjectKey>& keys,
     const std::vector<std::vector<Slice>>& batched_slices,
     const TenantId& tenant_id) {
@@ -706,8 +708,8 @@ tl::expected<void*, ErrorCode> KvClientBackend::BatchPutAsync(
     });
 }
 
-tl::expected<void*, ErrorCode> KvClientBackend::RemoveAsync(
-    const ObjectKey& key, const TenantId& tenant_id) {
+tl::expected<ExternalStoreBackend::TaskHandle, ErrorCode>
+KvClientBackend::RemoveAsync(const ObjectKey& key, const TenantId& tenant_id) {
     auto encoded = EncodeKey(key, tenant_id);
     if (!encoded) return tl::unexpected(encoded.error());
     kv::TaskId task;
@@ -719,8 +721,9 @@ tl::expected<void*, ErrorCode> KvClientBackend::RemoveAsync(
     });
 }
 
-tl::expected<void*, ErrorCode> KvClientBackend::BatchRemoveAsync(
-    const std::vector<ObjectKey>& keys, const TenantId& tenant_id) {
+tl::expected<ExternalStoreBackend::TaskHandle, ErrorCode>
+KvClientBackend::BatchRemoveAsync(const std::vector<ObjectKey>& keys,
+                                  const TenantId& tenant_id) {
     if (keys.empty()) {
         return SaveTask(
             [] { return std::vector<tl::expected<void, ErrorCode>>{}; });
