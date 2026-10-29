@@ -443,7 +443,12 @@ KvClientBackend::SubmitLoads(
             results[i] = tl::unexpected(key.error());
             continue;
         }
-        const auto layout = ResolveStoreLayout(parsed);
+        const auto base_offset = ResolveBaseOffset(parsed);
+        const auto capacity =
+            layout_
+                ? (parsed.layer ? layout_->shard_bytes
+                                : layout_->layer_count * layout_->shard_bytes)
+                : 0;
         std::vector<kv::KVBuffer> object_entries;
         if (targets[i].empty()) {
             results[i] = tl::unexpected(ErrorCode::INVALID_PARAMS);
@@ -452,13 +457,13 @@ KvClientBackend::SubmitLoads(
         for (size_t j = 0; j < targets[i].size(); ++j) {
             const auto& slice = targets[i][j];
             uint64_t object_offset = source_offsets[i][j];
-            if (layout) {
-                if (object_offset > layout->capacity ||
-                    slice.size > layout->capacity - object_offset) {
+            if (layout_) {
+                if (object_offset > capacity ||
+                    slice.size > capacity - object_offset) {
                     results[i] = tl::unexpected(ErrorCode::INVALID_PARAMS);
                     break;
                 }
-                object_offset += layout->base_offset;
+                object_offset += base_offset;
             }
             device::PointerInfo info{.kind = device::MemoryKind::kHost,
                                      .device_id = -1};
@@ -533,9 +538,8 @@ KvClientBackend::SubmitLoads(
     });
 }
 
-std::optional<KvClientBackend::StoreLayout> KvClientBackend::ResolveStoreLayout(
-    const VllmKey& parsed) const {
-    if (!layout_) return std::nullopt;
+uint64_t KvClientBackend::ResolveBaseOffset(const VllmKey& parsed) const {
+    if (!layout_) return 0;
     const auto rank = (parsed.pp_rank * layout_->pcp_size + parsed.pcp_rank) *
                           layout_->dcp_size +
                       parsed.dcp_rank;
@@ -545,14 +549,13 @@ std::optional<KvClientBackend::StoreLayout> KvClientBackend::ResolveStoreLayout(
                  layout_->head_or_tp_size +
              parsed.head_or_tp_rank) *
             layout_->shard_bytes;
-        return std::optional<StoreLayout>{
-            StoreLayout{base_offset, layout_->shard_bytes}};
+        return base_offset;
     }
     // A non-layerwise key occupies one contiguous slot for all its slices.
     const auto capacity = layout_->layer_count * layout_->shard_bytes;
     const auto base_offset =
         (rank * layout_->head_or_tp_size + parsed.head_or_tp_rank) * capacity;
-    return std::optional<StoreLayout>{StoreLayout{base_offset, capacity}};
+    return base_offset;
 }
 
 tl::expected<const kv::RegisteredMemory*, ErrorCode>
@@ -573,7 +576,7 @@ KvClientBackend::FindRegisteredMemory(const Slice& slice) const {
 
 tl::expected<void, ErrorCode> KvClientBackend::AppendStoreEntries(
     const kv::CacheKey& key, const std::vector<Slice>& slices,
-    const std::optional<StoreLayout>& layout,
+    uint64_t base_offset, uint64_t capacity,
     std::vector<kv::KVBuffer>& entries) {
     if (slices.empty()) return tl::unexpected(ErrorCode::INVALID_PARAMS);
     uint64_t logical_offset = 0;
@@ -585,11 +588,11 @@ tl::expected<void, ErrorCode> KvClientBackend::AppendStoreEntries(
         while (consumed < slice.size) {
             uint64_t object_offset = logical_offset;
             uint64_t length = slice.size - consumed;
-            if (layout) {
-                if (logical_offset > layout->capacity ||
-                    length > layout->capacity - logical_offset)
+            if (layout_) {
+                if (logical_offset > capacity ||
+                    length > capacity - logical_offset)
                     return tl::unexpected(ErrorCode::INVALID_PARAMS);
-                object_offset += layout->base_offset;
+                object_offset += base_offset;
                 // Split descriptors, never pad or copy source payload.
                 length = std::min(length, uint64_t{0x00fffe00});
                 if (object_offset % 512 != 0 || length % 512 != 0)
@@ -625,10 +628,15 @@ std::vector<kv::KVBuffer> KvClientBackend::BuildStoreEntries(
             results[i] = tl::unexpected(key.error());
             continue;
         }
-        const auto layout = ResolveStoreLayout(parsed);
+        const auto base_offset = ResolveBaseOffset(parsed);
+        const auto capacity =
+            layout_
+                ? (parsed.layer ? layout_->shard_bytes
+                                : layout_->layer_count * layout_->shard_bytes)
+                : 0;
         const auto begin = entries.size();
-        results[i] =
-            AppendStoreEntries(*key, batched_slices[i], layout, entries);
+        results[i] = AppendStoreEntries(*key, batched_slices[i], base_offset,
+                                        capacity, entries);
         if (!results[i]) {
             entries.resize(begin);
             continue;

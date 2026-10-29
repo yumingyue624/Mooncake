@@ -68,16 +68,12 @@ class KvClientBackend final : public ExternalStoreBackend {
     ParseLayoutConfig(
         const std::unordered_map<std::string, std::string>& options);
     std::optional<LayoutConfig> layout_;
-    struct StoreLayout {
-        uint64_t base_offset;
-        uint64_t capacity;
-    };
-    std::optional<StoreLayout> ResolveStoreLayout(const VllmKey& parsed) const;
+    uint64_t ResolveBaseOffset(const VllmKey& parsed) const;
     tl::expected<const kv::RegisteredMemory*, ErrorCode> FindRegisteredMemory(
         const Slice& slice) const;
     tl::expected<void, ErrorCode> AppendStoreEntries(
         const kv::CacheKey& key, const std::vector<Slice>& slices,
-        const std::optional<StoreLayout>& layout,
+        uint64_t base_offset, uint64_t capacity,
         std::vector<kv::KVBuffer>& entries);
     std::vector<kv::KVBuffer> BuildStoreEntries(
         const TenantId& tenant_id, const std::vector<ObjectKey>& keys,
