@@ -555,7 +555,7 @@ tl::expected<void, ErrorCode> KvClientBackend::AppendStoreEntries(
         const auto addr = reinterpret_cast<uintptr_t>(slice.ptr);
         uint64_t consumed = 0;
         while (consumed < slice.size) {
-            uint64_t object_offset = 0;
+            uint64_t object_offset = logical_offset;
             uint64_t length = slice.size - consumed;
             if (layout) {
                 const auto layer = logical_offset / layout->layer_bytes;
@@ -577,7 +577,7 @@ tl::expected<void, ErrorCode> KvClientBackend::AppendStoreEntries(
             entry.offset = static_cast<uint32_t>(object_offset);
             entries.push_back(entry);
             consumed += length;
-            if (layout) logical_offset += length;
+            logical_offset += length;
         }
     }
     return {};
