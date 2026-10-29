@@ -20,16 +20,17 @@ class KvClientBackend final : public ExternalStoreBackend {
     tl::expected<void, ErrorCode> Init(
         const std::unordered_map<std::string, std::string>& options) override;
     tl::expected<void, ErrorCode> Shutdown() override;
-    tl::expected<void*, ErrorCode> Put(
-        const TenantId& tenant_id, const ObjectKey& key,
-        const std::vector<Slice>& slices) override;
-    tl::expected<void*, ErrorCode> BatchPut(
-        const TenantId& tenant_id, const std::vector<ObjectKey>& keys,
-        const std::vector<std::vector<Slice>>& batched_slices) override;
-    tl::expected<void*, ErrorCode> Remove(const TenantId& tenant_id,
-                                          const ObjectKey& key) override;
-    tl::expected<void*, ErrorCode> BatchRemove(
-        const TenantId& tenant_id, const std::vector<ObjectKey>& keys) override;
+    tl::expected<void*, ErrorCode> PutAsync(const ObjectKey& key,
+                                            const std::vector<Slice>& slices,
+                                            const TenantId& tenant_id) override;
+    tl::expected<void*, ErrorCode> BatchPutAsync(
+        const std::vector<ObjectKey>& keys,
+        const std::vector<std::vector<Slice>>& batched_slices,
+        const TenantId& tenant_id) override;
+    tl::expected<void*, ErrorCode> RemoveAsync(
+        const ObjectKey& key, const TenantId& tenant_id) override;
+    tl::expected<void*, ErrorCode> BatchRemoveAsync(
+        const std::vector<ObjectKey>& keys, const TenantId& tenant_id) override;
 
     tl::expected<TaskHandle, ErrorCode> BatchExistsAsync(
         const std::vector<ObjectKey>& keys, const TenantId& tenant_id,

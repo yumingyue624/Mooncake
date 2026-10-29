@@ -575,9 +575,9 @@ std::vector<tl::expected<void, ErrorCode>> KvClientBackend::WaitForWrite(
     return results;
 }
 
-tl::expected<void*, ErrorCode> KvClientBackend::Put(
-    const TenantId& tenant_id, const ObjectKey& key,
-    const std::vector<Slice>& slices) {
+tl::expected<void*, ErrorCode> KvClientBackend::PutAsync(
+    const ObjectKey& key, const std::vector<Slice>& slices,
+    const TenantId& tenant_id) {
     std::unique_lock memory_lock(memory_mutex_);
     std::vector<size_t> indices;
     std::vector<tl::expected<void, ErrorCode>> results;
@@ -593,9 +593,10 @@ tl::expected<void*, ErrorCode> KvClientBackend::Put(
     });
 }
 
-tl::expected<void*, ErrorCode> KvClientBackend::BatchPut(
-    const TenantId& tenant_id, const std::vector<ObjectKey>& keys,
-    const std::vector<std::vector<Slice>>& batched_slices) {
+tl::expected<void*, ErrorCode> KvClientBackend::BatchPutAsync(
+    const std::vector<ObjectKey>& keys,
+    const std::vector<std::vector<Slice>>& batched_slices,
+    const TenantId& tenant_id) {
     if (keys.size() != batched_slices.size())
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     std::unique_lock memory_lock(memory_mutex_);
@@ -617,8 +618,8 @@ tl::expected<void*, ErrorCode> KvClientBackend::BatchPut(
     });
 }
 
-tl::expected<void*, ErrorCode> KvClientBackend::Remove(
-    const TenantId& tenant_id, const ObjectKey& key) {
+tl::expected<void*, ErrorCode> KvClientBackend::RemoveAsync(
+    const ObjectKey& key, const TenantId& tenant_id) {
     kv::TaskId task;
     auto submitted = sdk_->DeleteAsync({EncodeKey(key, tenant_id)}, task);
     if (!submitted.ok()) return tl::unexpected(ToError(submitted));
@@ -628,8 +629,8 @@ tl::expected<void*, ErrorCode> KvClientBackend::Remove(
     });
 }
 
-tl::expected<void*, ErrorCode> KvClientBackend::BatchRemove(
-    const TenantId& tenant_id, const std::vector<ObjectKey>& keys) {
+tl::expected<void*, ErrorCode> KvClientBackend::BatchRemoveAsync(
+    const std::vector<ObjectKey>& keys, const TenantId& tenant_id) {
     if (keys.empty()) {
         return SaveTask(
             [] { return std::vector<tl::expected<void, ErrorCode>>{}; });
