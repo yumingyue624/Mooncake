@@ -60,7 +60,6 @@ class KvClientBackend final : public ExternalStoreBackend {
         uint64_t layer_slots = 0;
         uint64_t kv_group_slots = 0;
         uint64_t group_slot_bytes = 0;
-        uint64_t object_capacity = 0;
     };
     static tl::expected<std::optional<LayoutConfig>, ErrorCode>
     ParseLayoutConfig(

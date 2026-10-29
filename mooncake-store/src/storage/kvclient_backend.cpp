@@ -1,7 +1,6 @@
 #include "storage/kvclient_backend.h"
 
 #include <algorithm>
-#include <array>
 #include <charconv>
 #include <cstring>
 #include <functional>
@@ -20,54 +19,105 @@ namespace {
 struct VllmKey {
     std::string_view model_name;
     std::string_view chunk_hash;
+    std::string storage_key;
     uint64_t pp_rank = 0;
     uint64_t pcp_rank = 0;
     uint64_t dcp_rank = 0;
     uint64_t head_or_tp_rank = 0;
     std::optional<uint64_t> layer;
+    bool has_pp_rank = false;
+    bool has_pcp_rank = false;
+    bool has_dcp_rank = false;
+    bool has_head_or_tp_rank = false;
 };
 
-bool ParseRank(std::string_view field, std::string_view prefix,
-               uint64_t& value) {
-    if (!field.starts_with(prefix)) return false;
-    field.remove_prefix(prefix.size());
+bool ParseRankValue(std::string_view text, uint64_t& value) {
     const auto [end, error] =
-        std::from_chars(field.data(), field.data() + field.size(), value);
-    return error == std::errc{} && end == field.data() + field.size();
+        std::from_chars(text.data(), text.data() + text.size(), value);
+    return error == std::errc{} && end == text.data() + text.size();
+}
+
+std::pair<std::string_view, std::string_view> SplitKeyField(
+    std::string_view field) {
+    const auto separator = field.find(':');
+    if (separator != std::string_view::npos)
+        return {field.substr(0, separator), field.substr(separator + 1)};
+    for (std::string_view name : {"pcp", "dcp"}) {
+        if (!field.starts_with(name)) continue;
+        const auto value = field.substr(name.size());
+        if (value.empty() || (value.front() >= '0' && value.front() <= '9') ||
+            value.front() == '-' || value.front() == '+')
+            return {name, value};
+    }
+    return {field, {}};
 }
 
 tl::expected<VllmKey, ErrorCode> ParseVllmKey(std::string_view key) {
-    std::array<std::string_view, 6> fields;
-    for (size_t i = 0; i < fields.size() - 1; ++i) {
+    VllmKey parsed;
+    const auto first = key.find('@');
+    if (first == std::string_view::npos || first == 0)
+        return tl::unexpected(ErrorCode::INVALID_KEY);
+    parsed.model_name = key.substr(0, first);
+    std::vector<std::string_view> retained{parsed.model_name};
+    key.remove_prefix(first + 1);
+    while (true) {
         const auto end = key.find('@');
-        if (end == std::string_view::npos)
-            return tl::unexpected(ErrorCode::INVALID_KEY);
-        fields[i] = key.substr(0, end);
+        const auto field = key.substr(0, end);
+        if (field.empty()) return tl::unexpected(ErrorCode::INVALID_KEY);
+        const auto [name, value] = SplitKeyField(field);
+        uint64_t* rank = nullptr;
+        bool* present = nullptr;
+        if (name == "pp_rank") {
+            rank = &parsed.pp_rank;
+            present = &parsed.has_pp_rank;
+        } else if (name == "pcp") {
+            rank = &parsed.pcp_rank;
+            present = &parsed.has_pcp_rank;
+        } else if (name == "dcp") {
+            rank = &parsed.dcp_rank;
+            present = &parsed.has_dcp_rank;
+        } else if (name == "head_or_tp_rank" || name == "tp_rank") {
+            rank = &parsed.head_or_tp_rank;
+            present = &parsed.has_head_or_tp_rank;
+        }
+        if (rank) {
+            uint64_t number;
+            if (!ParseRankValue(value, number) || (*present && *rank != number))
+                return tl::unexpected(ErrorCode::INVALID_KEY);
+            *rank = number;
+            *present = true;
+        } else {
+            // Preserve unknown fields, values and order in the object identity.
+            retained.push_back(field);
+        }
+        if (end == std::string_view::npos) break;
         key.remove_prefix(end + 1);
     }
-    fields.back() = key;
-    if (key.find('@') != std::string_view::npos || fields[0].empty())
-        return tl::unexpected(ErrorCode::INVALID_KEY);
-    VllmKey parsed;
-    parsed.model_name = fields[0];
-    if (!ParseRank(fields[1], "pcp", parsed.pcp_rank) ||
-        !ParseRank(fields[2], "dcp", parsed.dcp_rank) ||
-        !ParseRank(fields[3], "head_or_tp_rank:", parsed.head_or_tp_rank))
-        return tl::unexpected(ErrorCode::INVALID_KEY);
-    if (fields[4].starts_with("pp_rank:")) {
-        if (!ParseRank(fields[4], "pp_rank:", parsed.pp_rank))
-            return tl::unexpected(ErrorCode::INVALID_KEY);
-        parsed.chunk_hash = fields[5];
-    } else {
-        // Current LayerPoolKey omits PP rank; only PP=1 is supported.
-        uint64_t layer;
-        if (!ParseRank(fields[5], "", layer))
-            return tl::unexpected(ErrorCode::INVALID_KEY);
-        parsed.layer = layer;
-        parsed.chunk_hash = fields[4];
+    // Current LayerPoolKey omits PP rank and ends with @hash@<layer>.
+    if (!parsed.has_pp_rank && retained.size() >= 3 &&
+        retained[retained.size() - 2].find(':') == std::string_view::npos) {
+        const auto last = retained.back();
+        const bool numeric = std::all_of(last.begin(), last.end(), [](char c) {
+            return c >= '0' && c <= '9';
+        });
+        if (numeric || last.front() == '-' || last.front() == '+') {
+            uint64_t layer;
+            if (!ParseRankValue(last, layer))
+                return tl::unexpected(ErrorCode::INVALID_KEY);
+            parsed.layer = layer;
+            retained.pop_back();
+        }
+    }
+    for (size_t i = 1; i < retained.size(); ++i) {
+        if (retained[i].find(':') == std::string_view::npos)
+            parsed.chunk_hash = retained[i];
     }
     if (parsed.chunk_hash.empty())
         return tl::unexpected(ErrorCode::INVALID_KEY);
+    for (const auto field : retained) {
+        if (!parsed.storage_key.empty()) parsed.storage_key.push_back('@');
+        parsed.storage_key.append(field);
+    }
     return parsed;
 }
 
@@ -110,9 +160,7 @@ kv::CacheKey KvClientBackend::EncodeKey(const ObjectKey& key,
     if (layout_) {
         auto parsed = ParseVllmKey(key);
         if (parsed) {
-            identity.assign(parsed->model_name);
-            identity.push_back('\0');
-            identity.append(parsed->chunk_hash);
+            identity = parsed->storage_key;
         }
     }
     const auto scoped_key = tenant_id.MakeScopedKey(identity);
@@ -192,7 +240,7 @@ KvClientBackend::ParseLayoutConfig(
         std::begin(fields), std::end(fields),
         [&](const auto& field) { return options.contains(field.first); });
     if (has_layout) {
-        layout.object_capacity = 1;
+        uint64_t object_capacity = 1;
         for (const auto& [name, value] : fields) {
             const auto it = options.find(name);
             if (it == options.end())
@@ -202,15 +250,14 @@ KvClientBackend::ParseLayoutConfig(
                 std::from_chars(text.data(), text.data() + text.size(), *value);
             if (error != std::errc{} || end != text.data() + text.size() ||
                 *value == 0 ||
-                layout.object_capacity >
-                    std::numeric_limits<uint64_t>::max() / *value)
+                object_capacity > std::numeric_limits<uint64_t>::max() / *value)
                 return tl::unexpected(ErrorCode::INVALID_PARAMS);
-            layout.object_capacity *= *value;
+            object_capacity *= *value;
         }
         if (layout.group_slot_bytes % 512 != 0)
             return tl::unexpected(ErrorCode::INVALID_PARAMS);
         if (layout.pp_size != 1 ||
-            layout.object_capacity >
+            object_capacity >
                 uint64_t{std::numeric_limits<uint32_t>::max()} + 1)
             return tl::unexpected(ErrorCode::NOT_SUPPORTED);
     }
@@ -443,7 +490,11 @@ KvClientBackend::ResolveStoreLayout(const ObjectKey& key,
     if (!layout_) return std::optional<StoreLayout>{};
     auto parsed = ParseVllmKey(key);
     if (!parsed) return tl::unexpected(parsed.error());
-    if (parsed->pp_rank >= layout_->pp_size ||
+    if ((!parsed->has_pp_rank && layout_->pp_size != 1) ||
+        (!parsed->has_pcp_rank && layout_->pcp_size != 1) ||
+        (!parsed->has_dcp_rank && layout_->dcp_size != 1) ||
+        (!parsed->has_head_or_tp_rank && layout_->kv_group_slots != 1) ||
+        parsed->pp_rank >= layout_->pp_size ||
         parsed->pcp_rank >= layout_->pcp_size ||
         parsed->dcp_rank >= layout_->dcp_size ||
         parsed->head_or_tp_rank >= layout_->kv_group_slots ||
