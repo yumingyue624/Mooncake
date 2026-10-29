@@ -68,6 +68,8 @@ class KvClientBackend final : public ExternalStoreBackend {
     ParseLayoutConfig(
         const std::unordered_map<std::string, std::string>& options);
     std::optional<LayoutConfig> layout_;
+    tl::expected<void, ErrorCode> ValidateKeyLayout(
+        const VllmKey& parsed) const;
     uint64_t ResolveBaseOffset(const VllmKey& parsed) const;
     tl::expected<const kv::RegisteredMemory*, ErrorCode> FindRegisteredMemory(
         const Slice& slice) const;

@@ -160,22 +160,29 @@ ErrorCode ToError(const kv::Status& status) {
 
 }  // namespace
 
+tl::expected<void, ErrorCode> KvClientBackend::ValidateKeyLayout(
+    const VllmKey& parsed) const {
+    if ((!parsed.has_pp_rank && layout_->pp_size != 1) ||
+        (!parsed.has_pcp_rank && layout_->pcp_size != 1) ||
+        (!parsed.has_dcp_rank && layout_->dcp_size != 1) ||
+        (!parsed.has_head_or_tp_rank && layout_->head_or_tp_size != 1) ||
+        parsed.pp_rank >= layout_->pp_size ||
+        parsed.pcp_rank >= layout_->pcp_size ||
+        parsed.dcp_rank >= layout_->dcp_size ||
+        parsed.head_or_tp_rank >= layout_->head_or_tp_size ||
+        (parsed.layer && *parsed.layer >= layout_->layer_count))
+        return tl::unexpected(ErrorCode::INVALID_KEY);
+    return {};
+}
+
 tl::expected<kv::CacheKey, ErrorCode> KvClientBackend::EncodeKey(
     const ObjectKey& key, const TenantId& tenant_id, VllmKey* parsed_key) {
     std::string identity = key;
     if (layout_) {
         auto parsed = ParseVllmKey(key);
         if (!parsed) return tl::unexpected(parsed.error());
-        if ((!parsed->has_pp_rank && layout_->pp_size != 1) ||
-            (!parsed->has_pcp_rank && layout_->pcp_size != 1) ||
-            (!parsed->has_dcp_rank && layout_->dcp_size != 1) ||
-            (!parsed->has_head_or_tp_rank && layout_->head_or_tp_size != 1) ||
-            parsed->pp_rank >= layout_->pp_size ||
-            parsed->pcp_rank >= layout_->pcp_size ||
-            parsed->dcp_rank >= layout_->dcp_size ||
-            parsed->head_or_tp_rank >= layout_->head_or_tp_size ||
-            (parsed->layer && *parsed->layer >= layout_->layer_count))
-            return tl::unexpected(ErrorCode::INVALID_KEY);
+        auto valid = ValidateKeyLayout(*parsed);
+        if (!valid) return tl::unexpected(valid.error());
         identity = parsed->storage_key;
         if (parsed_key) *parsed_key = std::move(*parsed);
     }
