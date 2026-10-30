@@ -2043,11 +2043,16 @@ void Client::FinishExternalPut(
     }
     if (!*submission) return;
     auto external = WaitExternal(*submission);
+    if (external.size() != native_results.size()) {
+        LOG(ERROR) << "External store result count mismatch: expected="
+                   << native_results.size() << ", actual=" << external.size();
+        return;
+    }
     for (size_t i = 0; i < external.size(); ++i) {
         if (!external[i]) {
             LOG(WARNING) << "External store operation failed at index=" << i
                          << ": " << external[i].error();
-        } else if (external.size() == native_results.size()) {
+        } else {
             native_results[i] = {};
         }
     }
