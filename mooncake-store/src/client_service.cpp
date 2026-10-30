@@ -2024,6 +2024,8 @@ bool Client::RedirectToHotCache(const std::string& key,
     return true;
 }
 
+// A key succeeds if either storage path succeeds; always wait for submitted
+// work.
 tl::expected<void, ErrorCode> Client::FinishExternalPut(
     const tl::expected<ExternalStoreBackend::TaskHandle, ErrorCode>& submission,
     tl::expected<void, ErrorCode> native_result) {
@@ -3844,6 +3846,7 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPutRevoke(
     return master_client_.BatchPutRevoke(keys, replica_type);
 }
 
+// Drain external deletes for diagnostics; callers return the native result.
 void Client::FinishExternalRemove(
     const tl::expected<ExternalStoreBackend::TaskHandle, ErrorCode>&
         submission) {
