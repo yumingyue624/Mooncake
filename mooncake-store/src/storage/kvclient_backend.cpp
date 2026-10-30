@@ -18,6 +18,7 @@ namespace mooncake {
 struct KvClientBackend::VllmKey {
     std::string_view model_name;
     std::string_view chunk_hash;
+    // Retained fields form the object identity; ranks/layer select its offset.
     std::string storage_key;
     uint64_t pp_rank = 0;
     uint64_t pcp_rank = 0;
@@ -43,6 +44,7 @@ std::pair<std::string_view, std::string_view> SplitKeyField(
     const auto separator = field.find(':');
     if (separator != std::string_view::npos)
         return {field.substr(0, separator), field.substr(separator + 1)};
+    // Accept compact fields (pcp0/dcp0) as well as named fields (pcp:0/dcp:0).
     for (std::string_view name : {"pcp", "dcp"}) {
         if (!field.starts_with(name)) continue;
         const auto value = field.substr(name.size());
@@ -162,6 +164,7 @@ ErrorCode ToError(const kv::Status& status) {
 
 tl::expected<void, ErrorCode> KvClientBackend::ValidateKeyLayout(
     const VllmKey& parsed) const {
+    // An omitted rank is unambiguous only when its dimension has size one.
     if ((!parsed.has_pp_rank && layout_->pp_size != 1) ||
         (!parsed.has_pcp_rank && layout_->pcp_size != 1) ||
         (!parsed.has_dcp_rank && layout_->dcp_size != 1) ||
@@ -179,11 +182,14 @@ tl::expected<kv::CacheKey, ErrorCode> KvClientBackend::EncodeKey(
     const ObjectKey& key, const TenantId& tenant_id, VllmKey* parsed_key) {
     std::string identity = key;
     if (layout_) {
+        // Reject invalid layout keys consistently for writes, reads and
+        // deletes.
         auto parsed = ParseVllmKey(key);
         if (!parsed) return tl::unexpected(parsed.error());
         auto valid = ValidateKeyLayout(*parsed);
         if (!valid) return tl::unexpected(valid.error());
         identity = parsed->storage_key;
+        // Reuse the parsed ranks when constructing transfer offsets.
         if (parsed_key) *parsed_key = std::move(*parsed);
     }
     const auto scoped_key = tenant_id.MakeScopedKey(identity);
@@ -463,6 +469,8 @@ KvClientBackend::SubmitLoads(
         }
         for (size_t j = 0; j < targets[i].size(); ++j) {
             const auto& slice = targets[i][j];
+            // Range offsets are relative to this key's slot, not the SDK
+            // object.
             uint64_t object_offset = source_offsets[i][j];
             if (layout_) {
                 if (object_offset > capacity ||
@@ -551,6 +559,7 @@ uint64_t KvClientBackend::ResolveBaseOffset(const VllmKey& parsed) const {
                           layout_->dcp_size +
                       parsed.dcp_rank;
     if (parsed.layer) {
+        // Layerwise: [PP][PCP][DCP][layer][head/TP][shard_bytes].
         const auto base_offset =
             ((rank * layout_->layer_count + *parsed.layer) *
                  layout_->head_or_tp_size +
@@ -586,6 +595,7 @@ tl::expected<void, ErrorCode> KvClientBackend::AppendStoreEntries(
     uint64_t base_offset, uint64_t capacity,
     std::vector<kv::KVBuffer>& entries) {
     if (slices.empty()) return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    // Preserve slice order even when the source addresses are noncontiguous.
     uint64_t logical_offset = 0;
     for (const auto& slice : slices) {
         auto registered = FindRegisteredMemory(slice);
@@ -645,6 +655,7 @@ std::vector<kv::KVBuffer> KvClientBackend::BuildStoreEntries(
         results[i] = AppendStoreEntries(*key, batched_slices[i], base_offset,
                                         capacity, entries);
         if (!results[i]) {
+            // Do not submit a partial set of descriptors for this input key.
             entries.resize(begin);
             continue;
         }
@@ -661,6 +672,7 @@ std::vector<tl::expected<void, ErrorCode>> KvClientBackend::WaitForWrite(
     const bool has_entries =
         (status.ok() || status.code == kv::StatusCode::PARTIAL_FAILED) &&
         completed.entryStatus.size() == indices.size();
+    // Multiple SDK entries can belong to one input key; any failure wins.
     for (size_t j = 0; j < indices.size(); ++j) {
         const auto error =
             ToError(has_entries ? completed.entryStatus[j] : status);

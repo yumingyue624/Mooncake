@@ -56,17 +56,19 @@ class KvClientBackend final : public ExternalStoreBackend {
    private:
     struct VllmKey;
     static tl::expected<VllmKey, ErrorCode> ParseVllmKey(std::string_view key);
+    // Slot dimensions must match across writers sharing an external object.
     struct LayoutConfig {
         uint64_t pp_size = 0;
         uint64_t pcp_size = 0;
         uint64_t dcp_size = 0;
-        uint64_t layer_count = 0;
-        uint64_t head_or_tp_size = 0;
-        uint64_t shard_bytes = 0;
+        uint64_t layer_count = 0;      // Layer slots reserved per PP rank.
+        uint64_t head_or_tp_size = 0;  // Number of head_or_tp_rank values.
+        uint64_t shard_bytes = 0;  // Bytes reserved per layer and head/TP slot.
     };
     static tl::expected<std::optional<LayoutConfig>, ErrorCode>
     ParseLayoutConfig(
         const std::unordered_map<std::string, std::string>& options);
+    // No layout: hash the original key and store slices contiguously from zero.
     std::optional<LayoutConfig> layout_;
     tl::expected<void, ErrorCode> ValidateKeyLayout(
         const VllmKey& parsed) const;
