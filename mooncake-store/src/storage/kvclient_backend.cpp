@@ -12,6 +12,7 @@
 #include <utility>
 
 #include "device/accelerator_registry.h"
+#include "integer_parser.h"
 
 namespace mooncake {
 
@@ -32,12 +33,6 @@ struct KvClientBackend::VllmKey {
 };
 
 namespace {
-
-bool ParseRankValue(std::string_view text, uint64_t& value) {
-    const auto [end, error] =
-        std::from_chars(text.data(), text.data() + text.size(), value);
-    return error == std::errc{} && end == text.data() + text.size();
-}
 
 std::pair<std::string_view, std::string_view> SplitKeyField(
     std::string_view field) {
@@ -87,10 +82,10 @@ tl::expected<KvClientBackend::VllmKey, ErrorCode> KvClientBackend::ParseVllmKey(
             present = &parsed.has_head_or_tp_rank;
         }
         if (rank) {
-            uint64_t number;
-            if (!ParseRankValue(value, number) || (*present && *rank != number))
+            const auto number = TryParseInteger<uint64_t>(value);
+            if (!number || (*present && *rank != *number))
                 return tl::unexpected(ErrorCode::INVALID_KEY);
-            *rank = number;
+            *rank = *number;
             *present = true;
         } else {
             // Preserve unknown fields, values and order in the object identity.
@@ -109,10 +104,9 @@ tl::expected<KvClientBackend::VllmKey, ErrorCode> KvClientBackend::ParseVllmKey(
             return c >= '0' && c <= '9';
         });
         if (numeric || last.front() == '-' || last.front() == '+') {
-            uint64_t layer;
-            if (!ParseRankValue(last, layer))
-                return tl::unexpected(ErrorCode::INVALID_KEY);
-            parsed.layer = layer;
+            const auto layer = TryParseInteger<uint64_t>(last);
+            if (!layer) return tl::unexpected(ErrorCode::INVALID_KEY);
+            parsed.layer = *layer;
             retained.pop_back();
         }
     }
