@@ -5,6 +5,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <shared_mutex>
 #include <string_view>
 #include <unordered_set>
 #include <utility>
@@ -108,7 +109,7 @@ class KvClientBackend final : public ExternalStoreBackend {
     std::unique_ptr<kv::KvClient> sdk_;
     std::mutex tasks_mutex_;
     std::unordered_set<TaskHandle> tasks_;
-    std::mutex memory_mutex_;
+    std::shared_mutex memory_mutex_;
     std::map<uintptr_t, kv::RegisteredMemory> regions_;
 };
 
