@@ -103,7 +103,7 @@ tl::expected<KvClientBackend::VllmKey, ErrorCode> KvClientBackend::ParseVllmKey(
     // At least model@hash@layer must remain after removing rank fields.
     constexpr size_t kMinLayerwiseKeyFields = 3;
     if (!parsed.has_pp_rank && retained.size() >= kMinLayerwiseKeyFields &&
-        retained[retained.size() - 2].find(':') == std::string_view::npos) {
+        std::next(retained.rbegin())->find(':') == std::string_view::npos) {
         const auto last = retained.back();
         const bool numeric = std::all_of(last.begin(), last.end(), [](char c) {
             return c >= '0' && c <= '9';
