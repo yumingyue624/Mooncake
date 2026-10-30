@@ -100,7 +100,9 @@ tl::expected<KvClientBackend::VllmKey, ErrorCode> KvClientBackend::ParseVllmKey(
         key.remove_prefix(end + 1);
     }
     // Current LayerPoolKey omits PP rank and ends with @hash@<layer>.
-    if (!parsed.has_pp_rank && retained.size() >= 3 &&
+    // At least model@hash@layer must remain after removing rank fields.
+    constexpr size_t kMinLayerwiseKeyFields = 3;
+    if (!parsed.has_pp_rank && retained.size() >= kMinLayerwiseKeyFields &&
         retained[retained.size() - 2].find(':') == std::string_view::npos) {
         const auto last = retained.back();
         const bool numeric = std::all_of(last.begin(), last.end(), [](char c) {
