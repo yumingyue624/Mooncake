@@ -637,7 +637,7 @@ std::vector<kv::KVBuffer> KvClientBackend::BuildStoreEntries(
     const std::vector<std::vector<Slice>>& batched_slices,
     std::vector<size_t>& indices,
     std::vector<tl::expected<void, ErrorCode>>& results) {
-    // The caller holds memory_mutex_ throughout layout/registration resolution.
+    // The caller holds a shared memory lock while resolving registrations.
     std::vector<kv::KVBuffer> entries;
     results.resize(keys.size());
     for (size_t i = 0; i < keys.size(); ++i) {
@@ -688,7 +688,7 @@ tl::expected<ExternalStoreBackend::TaskHandle, ErrorCode>
 KvClientBackend::PutAsync(const ObjectKey& key,
                           const std::vector<Slice>& slices,
                           const TenantId& tenant_id) {
-    std::unique_lock memory_lock(memory_mutex_);
+    std::shared_lock memory_lock(memory_mutex_);
     std::vector<size_t> indices;
     std::vector<tl::expected<void, ErrorCode>> results;
     auto entries =
@@ -710,7 +710,7 @@ KvClientBackend::BatchPutAsync(
     const TenantId& tenant_id) {
     if (keys.size() != batched_slices.size())
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
-    std::unique_lock memory_lock(memory_mutex_);
+    std::shared_lock memory_lock(memory_mutex_);
     std::vector<size_t> indices;
     std::vector<tl::expected<void, ErrorCode>> results;
     auto entries =
