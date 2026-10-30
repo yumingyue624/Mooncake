@@ -2452,12 +2452,27 @@ PYBIND11_MODULE(store, m) {
                     // Flatten backend options into ConfigDict.
                     if (key == "external_store_options" &&
                         py::isinstance<py::dict>(item.second)) {
-                        for (auto option :
-                             py::reinterpret_borrow<py::dict>(item.second)) {
-                            std::string option_key = py::str(option.first);
-                            config[key + "." + option_key] =
-                                py::str(option.second);
-                        }
+                        std::function<void(const py::dict &,
+                                           const std::string &)>
+                            flatten_options;
+                        flatten_options = [&](const py::dict &options,
+                                              const std::string &prefix) {
+                            for (auto option : options) {
+                                const auto name =
+                                    prefix + "." +
+                                    std::string(py::str(option.first));
+                                if (py::isinstance<py::dict>(option.second)) {
+                                    flatten_options(
+                                        py::reinterpret_borrow<py::dict>(
+                                            option.second),
+                                        name);
+                                } else {
+                                    config[name] = py::str(option.second);
+                                }
+                            }
+                        };
+                        flatten_options(
+                            py::reinterpret_borrow<py::dict>(item.second), key);
                         continue;
                     }
                     std::string value = py::str(item.second);
