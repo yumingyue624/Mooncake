@@ -831,6 +831,10 @@ class Client {
     void FinishExternalRemove(
         const tl::expected<ExternalStoreBackend::TaskHandle, ErrorCode>&
             submission);
+    tl::expected<void, ErrorCode> FinishExternalPut(
+        const tl::expected<ExternalStoreBackend::TaskHandle, ErrorCode>&
+            submission,
+        tl::expected<void, ErrorCode> native_result = {});
     void FinishExternalPut(
         const tl::expected<ExternalStoreBackend::TaskHandle, ErrorCode>&
             submission,

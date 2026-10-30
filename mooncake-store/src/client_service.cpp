@@ -2024,6 +2024,13 @@ bool Client::RedirectToHotCache(const std::string& key,
     return true;
 }
 
+tl::expected<void, ErrorCode> Client::FinishExternalPut(
+    const tl::expected<ExternalStoreBackend::TaskHandle, ErrorCode>& submission,
+    tl::expected<void, ErrorCode> native_result) {
+    FinishExternalPut(submission, std::span(&native_result, 1));
+    return native_result;
+}
+
 // A key succeeds if either storage path succeeds; always wait for submitted
 // work.
 void Client::FinishExternalPut(
@@ -2060,10 +2067,8 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
         auto checksum_result = ComputeObjectChecksumForSlices(
             key, slices, CalculateSliceSize(slices));
         if (!checksum_result) {
-            tl::expected<void, ErrorCode> native_result =
-                tl::unexpected(checksum_result.error());
-            FinishExternalPut(external, std::span(&native_result, 1));
-            return native_result;
+            return FinishExternalPut(external,
+                                     tl::unexpected(checksum_result.error()));
         }
         object_checksum = *checksum_result;
     }
@@ -2094,9 +2099,7 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
         ErrorCode err = start_result.error();
         if (err == ErrorCode::OBJECT_ALREADY_EXISTS) {
             VLOG(1) << "object_already_exists key=" << key;
-            tl::expected<void, ErrorCode> native_result{};
-            FinishExternalPut(external, std::span(&native_result, 1));
-            return native_result;
+            return FinishExternalPut(external);
         }
         if (err == ErrorCode::NO_AVAILABLE_HANDLE) {
             LOG(WARNING) << "Failed to start put operation for key=" << key
@@ -2105,9 +2108,7 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
             LOG(ERROR) << "Failed to start put operation for key=" << key
                        << ": " << toString(err);
         }
-        tl::expected<void, ErrorCode> native_result = tl::unexpected(err);
-        FinishExternalPut(external, std::span(&native_result, 1));
-        return native_result;
+        return FinishExternalPut(external, tl::unexpected(err));
     }
 
     ReplicaTransferSummary transfer_summary;
@@ -2197,9 +2198,7 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
         if (!end_result) {
             ErrorCode err = end_result.error();
             LOG(ERROR) << "Failed to end put operation: " << err;
-            tl::expected<void, ErrorCode> native_result = tl::unexpected(err);
-            FinishExternalPut(external, std::span(&native_result, 1));
-            return native_result;
+            return FinishExternalPut(external, tl::unexpected(err));
         }
     }
 
@@ -2208,23 +2207,17 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
             master_client_.PutRevoke(key, *finalize_decision.revoke_type);
         if (!revoke_result) {
             LOG(ERROR) << "Failed to revoke put operation";
-            tl::expected<void, ErrorCode> native_result =
-                tl::unexpected(revoke_result.error());
-            FinishExternalPut(external, std::span(&native_result, 1));
-            return native_result;
+            return FinishExternalPut(external,
+                                     tl::unexpected(revoke_result.error()));
         }
     }
 
     if (!finalize_decision.success) {
-        tl::expected<void, ErrorCode> native_result =
-            tl::unexpected(finalize_decision.error);
-        FinishExternalPut(external, std::span(&native_result, 1));
-        return native_result;
+        return FinishExternalPut(external,
+                                 tl::unexpected(finalize_decision.error));
     }
 
-    tl::expected<void, ErrorCode> native_result{};
-    FinishExternalPut(external, std::span(&native_result, 1));
-    return native_result;
+    return FinishExternalPut(external);
 }
 
 namespace {
@@ -2296,10 +2289,8 @@ tl::expected<void, ErrorCode> Client::Upsert(const ObjectKey& key,
         auto checksum_result = ComputeObjectChecksumForSlices(
             key, slices, CalculateSliceSize(slices));
         if (!checksum_result) {
-            tl::expected<void, ErrorCode> native_result =
-                tl::unexpected(checksum_result.error());
-            FinishExternalPut(external, std::span(&native_result, 1));
-            return native_result;
+            return FinishExternalPut(external,
+                                     tl::unexpected(checksum_result.error()));
         }
         object_checksum = *checksum_result;
     }
@@ -2331,9 +2322,7 @@ tl::expected<void, ErrorCode> Client::Upsert(const ObjectKey& key,
             LOG(ERROR) << "Failed to start upsert operation for key=" << key
                        << ": " << toString(err);
         }
-        tl::expected<void, ErrorCode> native_result = tl::unexpected(err);
-        FinishExternalPut(external, std::span(&native_result, 1));
-        return native_result;
+        return FinishExternalPut(external, tl::unexpected(err));
     }
 
     ReplicaTransferSummary transfer_summary;
@@ -2419,9 +2408,7 @@ tl::expected<void, ErrorCode> Client::Upsert(const ObjectKey& key,
         if (!end_result) {
             ErrorCode err = end_result.error();
             LOG(ERROR) << "Failed to end upsert operation: " << err;
-            tl::expected<void, ErrorCode> native_result = tl::unexpected(err);
-            FinishExternalPut(external, std::span(&native_result, 1));
-            return native_result;
+            return FinishExternalPut(external, tl::unexpected(err));
         }
     }
     if (finalize_decision.revoke_type.has_value()) {
@@ -2429,17 +2416,13 @@ tl::expected<void, ErrorCode> Client::Upsert(const ObjectKey& key,
             master_client_.UpsertRevoke(key, *finalize_decision.revoke_type);
         if (!revoke_result) {
             LOG(ERROR) << "Failed to revoke upsert operation";
-            tl::expected<void, ErrorCode> native_result =
-                tl::unexpected(revoke_result.error());
-            FinishExternalPut(external, std::span(&native_result, 1));
-            return native_result;
+            return FinishExternalPut(external,
+                                     tl::unexpected(revoke_result.error()));
         }
     }
     if (!finalize_decision.success) {
-        tl::expected<void, ErrorCode> native_result =
-            tl::unexpected(finalize_decision.error);
-        FinishExternalPut(external, std::span(&native_result, 1));
-        return native_result;
+        return FinishExternalPut(external,
+                                 tl::unexpected(finalize_decision.error));
     }
 
     // Success-side invalidation: a concurrent read between the pre-upsert
@@ -2450,9 +2433,7 @@ tl::expected<void, ErrorCode> Client::Upsert(const ObjectKey& key,
         hot_cache_->RemoveHotKey(key);
     }
 
-    tl::expected<void, ErrorCode> native_result{};
-    FinishExternalPut(external, std::span(&native_result, 1));
-    return native_result;
+    return FinishExternalPut(external);
 }
 
 std::vector<tl::expected<void, ErrorCode>> Client::BatchUpsert(
