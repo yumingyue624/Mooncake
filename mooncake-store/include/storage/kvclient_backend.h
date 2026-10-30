@@ -4,6 +4,9 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
+#include <shared_mutex>
+#include <string_view>
 #include <unordered_set>
 #include <utility>
 
@@ -19,6 +22,18 @@ class KvClientBackend final : public ExternalStoreBackend {
     tl::expected<void, ErrorCode> Init(
         const std::unordered_map<std::string, std::string>& options) override;
     tl::expected<void, ErrorCode> Shutdown() override;
+    tl::expected<TaskHandle, ErrorCode> PutAsync(
+        const ObjectKey& key, const std::vector<Slice>& slices,
+        const TenantId& tenant_id) override;
+    tl::expected<TaskHandle, ErrorCode> BatchPutAsync(
+        const std::vector<ObjectKey>& keys,
+        const std::vector<std::vector<Slice>>& batched_slices,
+        const TenantId& tenant_id) override;
+    tl::expected<TaskHandle, ErrorCode> RemoveAsync(
+        const ObjectKey& key, const TenantId& tenant_id) override;
+    tl::expected<TaskHandle, ErrorCode> BatchRemoveAsync(
+        const std::vector<ObjectKey>& keys, const TenantId& tenant_id) override;
+
     tl::expected<TaskHandle, ErrorCode> BatchExistsAsync(
         const std::vector<ObjectKey>& keys, const TenantId& tenant_id,
         std::vector<uint8_t>* exists) override;
@@ -40,7 +55,45 @@ class KvClientBackend final : public ExternalStoreBackend {
     tl::expected<void, ErrorCode> UnregisterMemory(void* addr) override;
 
    private:
-    kv::CacheKey EncodeKey(const ObjectKey& key, const TenantId& tenant_id);
+    struct VllmKey;
+    tl::expected<VllmKey, ErrorCode> ParseVllmKey(std::string_view key) const;
+    // Zero disables aggregation for a dimension; configured sizes are positive.
+    // Options use aggregation.dimensions.<key field> and
+    // aggregation.shard_bytes.
+    struct LayoutConfig {
+        uint64_t pp_size = 0;
+        uint64_t pcp_size = 0;
+        uint64_t dcp_size = 0;
+        uint64_t layer_count = 0;      // Layer slots reserved per PP rank.
+        uint64_t head_or_tp_size = 0;  // Number of head_or_tp_rank values.
+        // Bytes per layer when aggregating layers, otherwise per input key.
+        uint64_t shard_bytes = 0;
+    };
+    // No layout: hash the original key and store slices contiguously from zero.
+    std::optional<LayoutConfig> layout_;
+    static tl::expected<std::optional<LayoutConfig>, ErrorCode>
+    ParseLayoutConfig(
+        const std::unordered_map<std::string, std::string>& options);
+    tl::expected<void, ErrorCode> ValidateKeyLayout(
+        const VllmKey& parsed) const;
+    uint64_t ResolveBaseOffset(const VllmKey& parsed) const;
+    tl::expected<const kv::RegisteredMemory*, ErrorCode> FindRegisteredMemory(
+        const Slice& slice) const;
+    tl::expected<void, ErrorCode> AppendStoreEntries(
+        const kv::CacheKey& key, const std::vector<Slice>& slices,
+        uint64_t base_offset, uint64_t capacity,
+        std::vector<kv::KVBuffer>& entries);
+    std::vector<kv::KVBuffer> BuildStoreEntries(
+        const TenantId& tenant_id, const std::vector<ObjectKey>& keys,
+        const std::vector<std::vector<Slice>>& batched_slices,
+        std::vector<size_t>& indices,
+        std::vector<tl::expected<void, ErrorCode>>& results);
+    std::vector<tl::expected<void, ErrorCode>> WaitForWrite(
+        kv::TaskId task, const std::vector<size_t>& indices,
+        std::vector<tl::expected<void, ErrorCode>> results);
+    tl::expected<kv::CacheKey, ErrorCode> EncodeKey(
+        const ObjectKey& key, const TenantId& tenant_id,
+        VllmKey* parsed_key = nullptr);
     kv::TaskResult WaitForCompletion(kv::TaskId task);
     tl::expected<TaskHandle, ErrorCode> SubmitLoads(
         const std::vector<ObjectKey>& keys,
@@ -59,7 +112,7 @@ class KvClientBackend final : public ExternalStoreBackend {
     std::unique_ptr<kv::KvClient> sdk_;
     std::mutex tasks_mutex_;
     std::unordered_set<TaskHandle> tasks_;
-    std::mutex memory_mutex_;
+    std::shared_mutex memory_mutex_;
     std::map<uintptr_t, kv::RegisteredMemory> regions_;
 };
 
