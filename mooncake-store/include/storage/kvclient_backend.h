@@ -65,11 +65,11 @@ class KvClientBackend final : public ExternalStoreBackend {
         uint64_t head_or_tp_size = 0;  // Number of head_or_tp_rank values.
         uint64_t shard_bytes = 0;  // Bytes reserved per layer and head/TP slot.
     };
+    // No layout: hash the original key and store slices contiguously from zero.
+    std::optional<LayoutConfig> layout_;
     static tl::expected<std::optional<LayoutConfig>, ErrorCode>
     ParseLayoutConfig(
         const std::unordered_map<std::string, std::string>& options);
-    // No layout: hash the original key and store slices contiguously from zero.
-    std::optional<LayoutConfig> layout_;
     tl::expected<void, ErrorCode> ValidateKeyLayout(
         const VllmKey& parsed) const;
     uint64_t ResolveBaseOffset(const VllmKey& parsed) const;
