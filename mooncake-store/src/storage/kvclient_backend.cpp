@@ -1,7 +1,6 @@
 #include "storage/kvclient_backend.h"
 
 #include <algorithm>
-#include <charconv>
 #include <cstring>
 #include <functional>
 #include <iterator>
@@ -53,7 +52,7 @@ std::pair<std::string_view, std::string_view> SplitKeyField(
 }  // namespace
 
 tl::expected<KvClientBackend::VllmKey, ErrorCode> KvClientBackend::ParseVllmKey(
-    std::string_view key) {
+    std::string_view key) const {
     VllmKey parsed;
     const auto first = key.find('@');
     if (first == std::string_view::npos || first == 0)
@@ -68,27 +67,33 @@ tl::expected<KvClientBackend::VllmKey, ErrorCode> KvClientBackend::ParseVllmKey(
         const auto [name, value] = SplitKeyField(field);
         uint64_t* rank = nullptr;
         bool* present = nullptr;
+        uint64_t dimension_size = 0;
         if (name == "pp_rank") {
             rank = &parsed.pp_rank;
             present = &parsed.has_pp_rank;
+            dimension_size = layout_->pp_size;
         } else if (name == "pcp") {
             rank = &parsed.pcp_rank;
             present = &parsed.has_pcp_rank;
+            dimension_size = layout_->pcp_size;
         } else if (name == "dcp") {
             rank = &parsed.dcp_rank;
             present = &parsed.has_dcp_rank;
+            dimension_size = layout_->dcp_size;
         } else if (name == "head_or_tp_rank" || name == "tp_rank") {
             rank = &parsed.head_or_tp_rank;
             present = &parsed.has_head_or_tp_rank;
+            dimension_size = layout_->head_or_tp_size;
         }
-        if (rank) {
+        if (rank && dimension_size != 0) {
             const auto number = TryParseInteger<uint64_t>(value);
             if (!number || (*present && *rank != *number))
                 return tl::unexpected(ErrorCode::INVALID_KEY);
             *rank = *number;
             *present = true;
         } else {
-            // Preserve unknown fields, values and order in the object identity.
+            // Keep unselected dimensions and unknown fields in the object key.
+            if (present) *present = true;
             retained.push_back(field);
         }
         if (end == std::string_view::npos) break;
@@ -107,11 +112,12 @@ tl::expected<KvClientBackend::VllmKey, ErrorCode> KvClientBackend::ParseVllmKey(
             const auto layer = TryParseInteger<uint64_t>(last);
             if (!layer) return tl::unexpected(ErrorCode::INVALID_KEY);
             parsed.layer = *layer;
-            retained.pop_back();
+            parsed.chunk_hash = *std::next(retained.rbegin());
+            if (layout_->layer_count != 0) retained.pop_back();
         }
     }
     for (size_t i = 1; i < retained.size(); ++i) {
-        if (retained[i].find(':') == std::string_view::npos)
+        if (!parsed.layer && retained[i].find(':') == std::string_view::npos)
             parsed.chunk_hash = retained[i];
     }
     if (parsed.chunk_hash.empty())
@@ -160,16 +166,21 @@ ErrorCode ToError(const kv::Status& status) {
 
 tl::expected<void, ErrorCode> KvClientBackend::ValidateKeyLayout(
     const VllmKey& parsed) const {
-    // An omitted rank is unambiguous only when its dimension has size one.
-    if ((!parsed.has_pp_rank && layout_->pp_size != 1) ||
-        (!parsed.has_pcp_rank && layout_->pcp_size != 1) ||
-        (!parsed.has_dcp_rank && layout_->dcp_size != 1) ||
-        (!parsed.has_head_or_tp_rank && layout_->head_or_tp_size != 1) ||
-        parsed.pp_rank >= layout_->pp_size ||
-        parsed.pcp_rank >= layout_->pcp_size ||
-        parsed.dcp_rank >= layout_->dcp_size ||
-        parsed.head_or_tp_rank >= layout_->head_or_tp_size ||
-        (parsed.layer && *parsed.layer >= layout_->layer_count))
+    // Only selected dimensions constrain ranks and contribute to the offset.
+    if ((layout_->pp_size != 0 &&
+         ((!parsed.has_pp_rank && layout_->pp_size != 1) ||
+          parsed.pp_rank >= layout_->pp_size)) ||
+        (layout_->pcp_size != 0 &&
+         ((!parsed.has_pcp_rank && layout_->pcp_size != 1) ||
+          parsed.pcp_rank >= layout_->pcp_size)) ||
+        (layout_->dcp_size != 0 &&
+         ((!parsed.has_dcp_rank && layout_->dcp_size != 1) ||
+          parsed.dcp_rank >= layout_->dcp_size)) ||
+        (layout_->head_or_tp_size != 0 &&
+         ((!parsed.has_head_or_tp_rank && layout_->head_or_tp_size != 1) ||
+          parsed.head_or_tp_rank >= layout_->head_or_tp_size)) ||
+        (layout_->layer_count != 0 && parsed.layer &&
+         *parsed.layer >= layout_->layer_count))
         return tl::unexpected(ErrorCode::INVALID_KEY);
     return {};
 }
@@ -252,41 +263,56 @@ KvClientBackend::ParseLayoutConfig(
     const std::unordered_map<std::string, std::string>& options) {
     LayoutConfig layout;
     const std::pair<const char*, uint64_t*> fields[] = {
-        {"pp_size", &layout.pp_size},
-        {"pcp_size", &layout.pcp_size},
-        {"dcp_size", &layout.dcp_size},
-        {"layer_count", &layout.layer_count},
-        {"head_or_tp_size", &layout.head_or_tp_size},
-        {"shard_bytes", &layout.shard_bytes},
+        {"pp_rank", &layout.pp_size},
+        {"pcp", &layout.pcp_size},
+        {"dcp", &layout.dcp_size},
+        {"layer", &layout.layer_count},
+        {"head_or_tp_rank", &layout.head_or_tp_size},
     };
-    // Existing SDK-only configurations remain valid. A layout, when supplied,
-    // must specify every dimension shared by all writers of an object.
-    const bool has_layout = std::any_of(
-        std::begin(fields), std::end(fields),
-        [&](const auto& field) { return options.contains(field.first); });
-    if (has_layout) {
-        uint64_t object_capacity = 1;
-        for (const auto& [name, value] : fields) {
-            const auto it = options.find(name);
-            if (it == options.end())
-                return tl::unexpected(ErrorCode::INVALID_PARAMS);
-            const auto& text = it->second;
-            const auto [end, error] =
-                std::from_chars(text.data(), text.data() + text.size(), *value);
-            if (error != std::errc{} || end != text.data() + text.size() ||
-                *value == 0 ||
-                object_capacity > std::numeric_limits<uint64_t>::max() / *value)
-                return tl::unexpected(ErrorCode::INVALID_PARAMS);
-            object_capacity *= *value;
-        }
-        if (layout.shard_bytes % 512 != 0)
+    // Reject obsolete layout options instead of silently changing object keys.
+    for (const auto* name : {"pp_size", "pcp_size", "dcp_size", "layer_count",
+                             "head_or_tp_size", "shard_bytes"}) {
+        if (options.contains(name))
             return tl::unexpected(ErrorCode::INVALID_PARAMS);
-        if (layout.pp_size != 1 ||
-            object_capacity >
-                uint64_t{std::numeric_limits<uint32_t>::max()} + 1)
-            return tl::unexpected(ErrorCode::NOT_SUPPORTED);
     }
-    return has_layout ? std::optional<LayoutConfig>{layout} : std::nullopt;
+    constexpr std::string_view kDimensionPrefix = "aggregation.dimensions.";
+    bool has_dimensions = false;
+    for (const auto& [name, text] : options) {
+        uint64_t* destination = nullptr;
+        if (name == "aggregation.shard_bytes") {
+            destination = &layout.shard_bytes;
+        } else if (name.starts_with(kDimensionPrefix)) {
+            const auto dimension =
+                std::string_view(name).substr(kDimensionPrefix.size());
+            for (const auto& [field, value] : fields) {
+                if (dimension == field) destination = value;
+            }
+            if (!destination) return tl::unexpected(ErrorCode::INVALID_PARAMS);
+            has_dimensions = true;
+        } else if (name == "aggregation" || name.starts_with("aggregation.")) {
+            return tl::unexpected(ErrorCode::INVALID_PARAMS);
+        } else {
+            continue;
+        }
+        const auto value = TryParseInteger<uint64_t>(text);
+        if (!value || *value == 0)
+            return tl::unexpected(ErrorCode::INVALID_PARAMS);
+        *destination = *value;
+    }
+    if (!has_dimensions) return std::nullopt;
+    if (layout.shard_bytes == 0 || layout.shard_bytes % 512 != 0)
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    uint64_t object_capacity = layout.shard_bytes;
+    for (const auto& [name, size] : fields) {
+        if (*size == 0) continue;
+        if (object_capacity > std::numeric_limits<uint64_t>::max() / *size)
+            return tl::unexpected(ErrorCode::INVALID_PARAMS);
+        object_capacity *= *size;
+    }
+    // SDK offsets are uint32; this is independent of storage capacity policy.
+    if (object_capacity > uint64_t{std::numeric_limits<uint32_t>::max()} + 1)
+        return tl::unexpected(ErrorCode::NOT_SUPPORTED);
+    return std::optional<LayoutConfig>{layout};
 }
 
 bool KvClientBackend::SupportsMemory(
@@ -454,10 +480,10 @@ KvClientBackend::SubmitLoads(
         }
         const auto base_offset = ResolveBaseOffset(parsed);
         const auto capacity =
-            layout_
-                ? (parsed.layer ? layout_->shard_bytes
-                                : layout_->layer_count * layout_->shard_bytes)
-                : 0;
+            layout_ ? ((parsed.layer || layout_->layer_count == 0)
+                           ? layout_->shard_bytes
+                           : layout_->layer_count * layout_->shard_bytes)
+                    : 0;
         std::vector<kv::KVBuffer> object_entries;
         if (targets[i].empty()) {
             results[i] = tl::unexpected(ErrorCode::INVALID_PARAMS);
@@ -551,23 +577,22 @@ KvClientBackend::SubmitLoads(
 
 uint64_t KvClientBackend::ResolveBaseOffset(const VllmKey& parsed) const {
     if (!layout_) return 0;
-    const auto rank = (parsed.pp_rank * layout_->pcp_size + parsed.pcp_rank) *
-                          layout_->dcp_size +
-                      parsed.dcp_rank;
-    if (parsed.layer) {
-        // Layerwise: [PP][PCP][DCP][layer][head/TP][shard_bytes].
-        const auto base_offset =
-            ((rank * layout_->layer_count + *parsed.layer) *
-                 layout_->head_or_tp_size +
-             parsed.head_or_tp_rank) *
-            layout_->shard_bytes;
-        return base_offset;
-    }
-    // A non-layerwise key occupies one contiguous slot for all its slices.
-    const auto capacity = layout_->layer_count * layout_->shard_bytes;
-    const auto base_offset =
-        (rank * layout_->head_or_tp_size + parsed.head_or_tp_rank) * capacity;
-    return base_offset;
+    // Fixed order: PP, PCP, DCP, layer, head/TP. Unselected axes are skipped.
+    uint64_t index = 0;
+    if (layout_->pp_size != 0) index = parsed.pp_rank;
+    if (layout_->pcp_size != 0)
+        index = index * layout_->pcp_size + parsed.pcp_rank;
+    if (layout_->dcp_size != 0)
+        index = index * layout_->dcp_size + parsed.dcp_rank;
+    if (layout_->layer_count != 0 && parsed.layer)
+        index = index * layout_->layer_count + *parsed.layer;
+    if (layout_->head_or_tp_size != 0)
+        index = index * layout_->head_or_tp_size + parsed.head_or_tp_rank;
+    // Non-layerwise inputs already contain all layers and stay contiguous.
+    const auto capacity = !parsed.layer && layout_->layer_count != 0
+                              ? layout_->layer_count * layout_->shard_bytes
+                              : layout_->shard_bytes;
+    return index * capacity;
 }
 
 tl::expected<const kv::RegisteredMemory*, ErrorCode>
@@ -643,10 +668,10 @@ std::vector<kv::KVBuffer> KvClientBackend::BuildStoreEntries(
         }
         const auto base_offset = ResolveBaseOffset(parsed);
         const auto capacity =
-            layout_
-                ? (parsed.layer ? layout_->shard_bytes
-                                : layout_->layer_count * layout_->shard_bytes)
-                : 0;
+            layout_ ? ((parsed.layer || layout_->layer_count == 0)
+                           ? layout_->shard_bytes
+                           : layout_->layer_count * layout_->shard_bytes)
+                    : 0;
         const auto begin = entries.size();
         results[i] = AppendStoreEntries(*key, batched_slices[i], base_offset,
                                         capacity, entries);
