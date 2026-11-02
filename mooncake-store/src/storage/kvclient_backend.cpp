@@ -672,7 +672,7 @@ std::vector<kv::KVBuffer> KvClientBackend::BuildStoreEntries(
     return entries;
 }
 
-std::vector<tl::expected<void, ErrorCode>> KvClientBackend::WaitForWrite(
+std::vector<tl::expected<void, ErrorCode>> KvClientBackend::WaitForKeyResults(
     kv::TaskId task, const std::vector<size_t>& indices,
     std::vector<tl::expected<void, ErrorCode>> results) {
     const auto completed = WaitForCompletion(task);
@@ -704,7 +704,7 @@ KvClientBackend::PutAsync(const ObjectKey& key,
     if (!submitted.ok()) return tl::unexpected(ToError(submitted));
     return SaveTask([this, task, indices = std::move(indices),
                      results = std::move(results)]() mutable {
-        return WaitForWrite(task, indices, std::move(results));
+        return WaitForKeyResults(task, indices, std::move(results));
     });
 }
 
@@ -729,7 +729,7 @@ KvClientBackend::BatchPutAsync(
     if (!submitted.ok()) return tl::unexpected(ToError(submitted));
     return SaveTask([this, task, indices = std::move(indices),
                      results = std::move(results)]() mutable {
-        return WaitForWrite(task, indices, std::move(results));
+        return WaitForKeyResults(task, indices, std::move(results));
     });
 }
 
@@ -741,8 +741,8 @@ KvClientBackend::RemoveAsync(const ObjectKey& key, const TenantId& tenant_id) {
     auto submitted = sdk_->DeleteAsync({*encoded}, task);
     if (!submitted.ok()) return tl::unexpected(ToError(submitted));
     return SaveTask([this, task] {
-        return WaitForWrite(task, {0},
-                            std::vector<tl::expected<void, ErrorCode>>(1));
+        return WaitForKeyResults(task, {0},
+                                 std::vector<tl::expected<void, ErrorCode>>(1));
     });
 }
 
@@ -777,7 +777,7 @@ KvClientBackend::BatchRemoveAsync(const std::vector<ObjectKey>& keys,
     if (!submitted.ok()) return tl::unexpected(ToError(submitted));
     return SaveTask([this, task, indices = std::move(indices),
                      results = std::move(results)]() mutable {
-        return WaitForWrite(task, indices, std::move(results));
+        return WaitForKeyResults(task, indices, std::move(results));
     });
 }
 

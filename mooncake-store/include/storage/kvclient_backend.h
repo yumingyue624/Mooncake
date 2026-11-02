@@ -87,7 +87,7 @@ class KvClientBackend final : public ExternalStoreBackend {
         const std::vector<std::vector<Slice>>& batched_slices,
         std::vector<size_t>& indices,
         std::vector<tl::expected<void, ErrorCode>>& results);
-    std::vector<tl::expected<void, ErrorCode>> WaitForWrite(
+    std::vector<tl::expected<void, ErrorCode>> WaitForKeyResults(
         kv::TaskId task, const std::vector<size_t>& indices,
         std::vector<tl::expected<void, ErrorCode>> results);
     tl::expected<kv::CacheKey, ErrorCode> EncodeKey(
