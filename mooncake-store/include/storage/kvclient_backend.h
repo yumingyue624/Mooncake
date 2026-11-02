@@ -81,8 +81,7 @@ class KvClientBackend final : public ExternalStoreBackend {
         const Slice& slice) const;
     tl::expected<void, ErrorCode> AppendStoreEntries(
         const kv::CacheKey& key, const std::vector<Slice>& slices,
-        uint64_t base_offset, uint64_t capacity,
-        std::vector<kv::KVBuffer>& entries);
+        uint64_t base_offset, std::vector<kv::KVBuffer>& entries);
     std::vector<kv::KVBuffer> BuildStoreEntries(
         const TenantId& tenant_id, const std::vector<ObjectKey>& keys,
         const std::vector<std::vector<Slice>>& batched_slices,

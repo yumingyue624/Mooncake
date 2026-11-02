@@ -300,7 +300,7 @@ KvClientBackend::ParseLayoutConfig(
         *destination = *value;
     }
     if (!has_dimensions) return std::nullopt;
-    if (layout.shard_bytes == 0 || layout.shard_bytes % 512 != 0)
+    if (layout.shard_bytes == 0)
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     uint64_t object_capacity = layout.shard_bytes;
     for (const auto& [name, size] : fields) {
@@ -479,11 +479,6 @@ KvClientBackend::SubmitLoads(
             continue;
         }
         const auto base_offset = ResolveBaseOffset(parsed);
-        const auto capacity =
-            layout_ ? ((parsed.layer || layout_->layer_count == 0)
-                           ? layout_->shard_bytes
-                           : layout_->layer_count * layout_->shard_bytes)
-                    : 0;
         std::vector<kv::KVBuffer> object_entries;
         if (targets[i].empty()) {
             results[i] = tl::unexpected(ErrorCode::INVALID_PARAMS);
@@ -493,15 +488,14 @@ KvClientBackend::SubmitLoads(
             const auto& slice = targets[i][j];
             // Range offsets are relative to this key's slot, not the SDK
             // object.
-            uint64_t object_offset = source_offsets[i][j];
-            if (layout_) {
-                if (object_offset > capacity ||
-                    slice.size > capacity - object_offset) {
-                    results[i] = tl::unexpected(ErrorCode::INVALID_PARAMS);
-                    break;
-                }
-                object_offset += base_offset;
+            const auto source_offset = source_offsets[i][j];
+            if (source_offset > std::numeric_limits<uint32_t>::max() ||
+                base_offset >
+                    std::numeric_limits<uint32_t>::max() - source_offset) {
+                results[i] = tl::unexpected(ErrorCode::NOT_SUPPORTED);
+                break;
             }
+            const auto object_offset = base_offset + source_offset;
             device::PointerInfo info{.kind = device::MemoryKind::kHost,
                                      .device_id = -1};
             runtime.FindDeviceForPointer(slice.ptr, &info);
@@ -516,8 +510,7 @@ KvClientBackend::SubmitLoads(
                 break;
             }
             // SDK offsets and lengths are limited to uint32.
-            if (object_offset > std::numeric_limits<uint32_t>::max() ||
-                slice.size > std::numeric_limits<uint32_t>::max()) {
+            if (slice.size > std::numeric_limits<uint32_t>::max()) {
                 results[i] = tl::unexpected(ErrorCode::NOT_SUPPORTED);
                 break;
             }
@@ -609,8 +602,7 @@ KvClientBackend::FindRegisteredMemory(const Slice& slice) const {
 
 tl::expected<void, ErrorCode> KvClientBackend::AppendStoreEntries(
     const kv::CacheKey& key, const std::vector<Slice>& slices,
-    uint64_t base_offset, uint64_t capacity,
-    std::vector<kv::KVBuffer>& entries) {
+    uint64_t base_offset, std::vector<kv::KVBuffer>& entries) {
     if (slices.empty()) return tl::unexpected(ErrorCode::INVALID_PARAMS);
     // Preserve slice order even when the source addresses are noncontiguous.
     uint64_t logical_offset = 0;
@@ -620,17 +612,16 @@ tl::expected<void, ErrorCode> KvClientBackend::AppendStoreEntries(
         const auto addr = reinterpret_cast<uintptr_t>(slice.ptr);
         uint64_t consumed = 0;
         while (consumed < slice.size) {
+            if (logical_offset > std::numeric_limits<uint32_t>::max() ||
+                base_offset >
+                    std::numeric_limits<uint32_t>::max() - logical_offset)
+                return tl::unexpected(ErrorCode::NOT_SUPPORTED);
             uint64_t object_offset = logical_offset;
             uint64_t length = slice.size - consumed;
             if (layout_) {
-                if (logical_offset > capacity ||
-                    length > capacity - logical_offset)
-                    return tl::unexpected(ErrorCode::INVALID_PARAMS);
                 object_offset += base_offset;
                 // Split descriptors, never pad or copy source payload.
                 length = std::min(length, uint64_t{0x00fffe00});
-                if (object_offset % 512 != 0 || length % 512 != 0)
-                    return tl::unexpected(ErrorCode::INVALID_PARAMS);
             }
             kv::KVBuffer entry{};
             entry.key = key;
@@ -663,14 +654,9 @@ std::vector<kv::KVBuffer> KvClientBackend::BuildStoreEntries(
             continue;
         }
         const auto base_offset = ResolveBaseOffset(parsed);
-        const auto capacity =
-            layout_ ? ((parsed.layer || layout_->layer_count == 0)
-                           ? layout_->shard_bytes
-                           : layout_->layer_count * layout_->shard_bytes)
-                    : 0;
         const auto begin = entries.size();
-        results[i] = AppendStoreEntries(*key, batched_slices[i], base_offset,
-                                        capacity, entries);
+        results[i] =
+            AppendStoreEntries(*key, batched_slices[i], base_offset, entries);
         if (!results[i]) {
             // Do not submit a partial set of descriptors for this input key.
             entries.resize(begin);
