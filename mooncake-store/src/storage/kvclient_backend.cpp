@@ -584,10 +584,11 @@ uint64_t KvClientBackend::ResolveBaseOffset(const VllmKey& parsed) const {
     if (layout_->head_or_tp_size != 0)
         index = index * layout_->head_or_tp_size + parsed.head_or_tp_rank;
     // Non-layerwise inputs already contain all layers and stay contiguous.
-    const auto capacity = !parsed.layer && layout_->layer_count != 0
-                              ? layout_->layer_count * layout_->shard_bytes
-                              : layout_->shard_bytes;
-    return index * capacity;
+    const auto shard_stride_bytes =
+        !parsed.layer && layout_->layer_count != 0
+            ? layout_->layer_count * layout_->shard_bytes
+            : layout_->shard_bytes;
+    return index * shard_stride_bytes;
 }
 
 tl::expected<const kv::RegisteredMemory*, ErrorCode>
