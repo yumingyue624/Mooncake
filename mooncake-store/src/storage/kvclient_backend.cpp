@@ -510,16 +510,9 @@ KvClientBackend::SubmitLoads(
                 break;
             }
             const auto addr = reinterpret_cast<uintptr_t>(slice.ptr);
-            auto region = regions_.upper_bound(addr);
-            if (region == regions_.begin()) {
-                results[i] = tl::unexpected(ErrorCode::INVALID_PARAMS);
-                break;
-            }
-            const auto& registered = std::prev(region)->second;
-            const auto region_offset = addr - registered.region.addr;
-            if (region_offset > registered.region.size ||
-                slice.size > registered.region.size - region_offset) {
-                results[i] = tl::unexpected(ErrorCode::INVALID_PARAMS);
+            auto registered = FindRegisteredMemory(slice);
+            if (!registered) {
+                results[i] = tl::unexpected(registered.error());
                 break;
             }
             // SDK offsets and lengths are limited to uint32.
@@ -530,8 +523,8 @@ KvClientBackend::SubmitLoads(
             }
             kv::KVBuffer entry{};
             entry.key = *key;
-            entry.buffer.region = registered.region;
-            entry.buffer.handle = registered.handle;
+            entry.buffer.region = (*registered)->region;
+            entry.buffer.handle = (*registered)->handle;
             entry.buffer.region.addr = addr;
             entry.buffer.region.size = slice.size;
             // Offset is relative to the object, not the registered region.
