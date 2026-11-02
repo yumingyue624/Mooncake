@@ -607,8 +607,14 @@ tl::expected<void, ErrorCode> KvClientBackend::AppendStoreEntries(
     // Preserve slice order even when the source addresses are noncontiguous.
     uint64_t logical_offset = 0;
     for (const auto& slice : slices) {
-        auto registered = FindRegisteredMemory(slice);
-        if (!registered) return tl::unexpected(registered.error());
+        kv::RegisteredMemory registered;
+        {
+            std::shared_lock lock(memory_mutex_);
+            auto region = FindRegisteredMemory(slice);
+            if (!region) return tl::unexpected(region.error());
+            // Keep a snapshot; the map entry may be erased after unlocking.
+            registered = **region;
+        }
         const auto addr = reinterpret_cast<uintptr_t>(slice.ptr);
         uint64_t consumed = 0;
         while (consumed < slice.size) {
@@ -625,10 +631,10 @@ tl::expected<void, ErrorCode> KvClientBackend::AppendStoreEntries(
             }
             kv::KVBuffer entry{};
             entry.key = key;
-            entry.buffer.region = (*registered)->region;
+            entry.buffer.region = registered.region;
             entry.buffer.region.addr = addr + consumed;
             entry.buffer.region.size = length;
-            entry.buffer.handle = (*registered)->handle;
+            entry.buffer.handle = registered.handle;
             entry.offset = static_cast<uint32_t>(object_offset);
             entries.push_back(entry);
             consumed += length;
@@ -643,7 +649,6 @@ std::vector<kv::KVBuffer> KvClientBackend::BuildStoreEntries(
     const std::vector<std::vector<Slice>>& batched_slices,
     std::vector<size_t>& indices,
     std::vector<tl::expected<void, ErrorCode>>& results) {
-    // The caller holds a shared memory lock while resolving registrations.
     std::vector<kv::KVBuffer> entries;
     results.resize(keys.size());
     for (size_t i = 0; i < keys.size(); ++i) {
@@ -689,7 +694,6 @@ tl::expected<ExternalStoreBackend::TaskHandle, ErrorCode>
 KvClientBackend::PutAsync(const ObjectKey& key,
                           const std::vector<Slice>& slices,
                           const TenantId& tenant_id) {
-    std::shared_lock memory_lock(memory_mutex_);
     std::vector<size_t> indices;
     std::vector<tl::expected<void, ErrorCode>> results;
     auto entries =
@@ -711,7 +715,6 @@ KvClientBackend::BatchPutAsync(
     const TenantId& tenant_id) {
     if (keys.size() != batched_slices.size())
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
-    std::shared_lock memory_lock(memory_mutex_);
     std::vector<size_t> indices;
     std::vector<tl::expected<void, ErrorCode>> results;
     auto entries =
