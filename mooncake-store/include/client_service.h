@@ -20,6 +20,7 @@
 #include "master_client.h"
 #include "storage_backend.h"
 #include "storage/external_store_backend.h"
+#include "storage/put_selection_policy.h"
 #include "thread_pool.h"
 #include "transfer_engine.h"
 #include "transfer_task.h"
@@ -83,6 +84,9 @@ class Client {
     using WriteBufferStager =
         std::function<tl::expected<std::vector<Slice>, ErrorCode>(
             const std::vector<Slice>&)>;
+
+    // Install before issuing writes. An empty policy restores dual writing.
+    void SetPutSelectionPolicy(PutSelectionPolicy policy);
 
     const UUID& getClientId() const { return client_id_; }
     const std::string& tenant_id() const { return master_client_.tenant_id(); }
@@ -828,6 +832,15 @@ class Client {
 
    private:
     friend class RealClient;
+    bool ShouldPutExternal(
+        const ObjectKey& key, const std::vector<Slice>& slices, PutKind kind,
+        const ReplicateConfig* config,
+        std::span<const size_t> destination_offsets = {}) const;
+    tl::expected<ExternalStoreBackend::TaskHandle, ErrorCode>
+    SubmitExternalBatchPut(const std::vector<ObjectKey>& keys,
+                           const std::vector<std::vector<Slice>>& slices,
+                           const ReplicateConfig& config, PutKind kind,
+                           std::vector<size_t>& selected_indices);
     void FinishExternalRemove(
         const tl::expected<ExternalStoreBackend::TaskHandle, ErrorCode>&
             submission);
@@ -838,7 +851,8 @@ class Client {
     void FinishExternalPut(
         const tl::expected<ExternalStoreBackend::TaskHandle, ErrorCode>&
             submission,
-        std::span<tl::expected<void, ErrorCode>> native_results);
+        std::span<tl::expected<void, ErrorCode>> native_results,
+        std::span<const size_t> selected_indices = {});
     bool ShouldUseExternal(
         const tl::expected<QueryResult, ErrorCode>& query) const;
     tl::expected<ExternalStoreBackend::TaskHandle, ErrorCode> LoadExternalAsync(
@@ -1048,6 +1062,7 @@ class Client {
     std::shared_ptr<StorageBackend> storage_backend_;
     std::shared_ptr<DistributedStorageBackend> dfs_storage_backend_;
     std::shared_ptr<ExternalStoreBackend> external_store_backend_;
+    PutSelectionPolicy put_selection_policy_;
 
     // Probe used by healDanglingLocalDiskReplica to prove a completed
     // LOCAL_DISK replica's backing file is gone. Installed by the owner of

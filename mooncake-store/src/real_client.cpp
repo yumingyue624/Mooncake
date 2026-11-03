@@ -1534,6 +1534,12 @@ tl::expected<void, ErrorCode> RealClient::initAll_internal(
                           device_name);
 }
 
+int RealClient::set_put_selection_policy(PutSelectionPolicy policy) {
+    if (!client_) return -toInt(ErrorCode::INVALID_PARAMS);
+    client_->SetPutSelectionPolicy(std::move(policy));
+    return 0;
+}
+
 int RealClient::initAll(const std::string &protocol_,
                         const std::string &device_name,
                         size_t mount_segment_size) {
@@ -7388,18 +7394,34 @@ std::vector<int> RealClient::batch_put_from_multi_buffer_ranges(
     } inflight_guard{this, std::move(inflight_keys)};
 
     tl::expected<ExternalStoreBackend::TaskHandle, ErrorCode> external{nullptr};
+    std::vector<size_t> selected_indices;
     if (client_->external_store_backend_) {
         std::vector<ObjectKey> external_keys;
+        std::vector<std::vector<Slice>> external_sources;
         std::vector<std::vector<size_t>> external_offsets;
         external_keys.reserve(idx_map.size());
         external_offsets.reserve(idx_map.size());
-        for (const auto i : idx_map) {
+        for (size_t k = 0; k < idx_map.size(); ++k) {
+            const auto i = idx_map[k];
+            if (!client_->ShouldPutExternal(keys[i], slices[k], PutKind::RANGE,
+                                            nullptr, all_dst_offsets[i]))
+                continue;
+            selected_indices.push_back(k);
             external_keys.push_back(keys[i]);
             external_offsets.push_back(all_dst_offsets[i]);
         }
-        external = client_->external_store_backend_->PutRangesAsync(
-            external_keys, slices, external_offsets,
-            TenantId(client_->master_client_.tenant_id()));
+        if (!selected_indices.empty()) {
+            const auto *sources = &slices;
+            if (selected_indices.size() != slices.size()) {
+                external_sources.reserve(selected_indices.size());
+                for (const auto k : selected_indices)
+                    external_sources.push_back(slices[k]);
+                sources = &external_sources;
+            }
+            external = client_->external_store_backend_->PutRangesAsync(
+                external_keys, *sources, external_offsets,
+                TenantId(client_->master_client_.tenant_id()));
+        }
     }
 
     auto transfer = client_->BatchTransferWriteRanges(replicas_per_entry,
@@ -7409,7 +7431,8 @@ std::vector<int> RealClient::batch_put_from_multi_buffer_ranges(
         for (size_t i = 0; i < transfer.size(); ++i) {
             if (!transfer[i]) statuses[i] = tl::unexpected(transfer[i].error());
         }
-        client_->FinishExternalPut(external, std::span(statuses));
+        client_->FinishExternalPut(external, std::span(statuses),
+                                   selected_indices);
         for (size_t i = 0; i < transfer.size(); ++i) {
             if (!transfer[i] && statuses[i]) {
                 // Count logical bytes once when only the external write
