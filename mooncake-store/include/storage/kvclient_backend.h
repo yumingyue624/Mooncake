@@ -62,17 +62,10 @@ class KvClientBackend final : public ExternalStoreBackend {
    private:
     struct VllmKey;
     tl::expected<VllmKey, ErrorCode> ParseVllmKey(std::string_view key) const;
-    // Zero disables aggregation for a dimension; configured sizes are positive.
-    // aggregation.dimensions maps pp/pcp/dcp/layer/head_or_tp to axis sizes;
-    // aggregation.shard_bytes specifies the byte stride of a shard.
+    // Only aggregation.dimensions.layer and aggregation.shard_bytes are used.
     struct LayoutConfig {
-        uint64_t pp_size = 0;
-        uint64_t pcp_size = 0;
-        uint64_t dcp_size = 0;
-        uint64_t layer_count = 0;      // Layer slots reserved per PP rank.
-        uint64_t head_or_tp_size = 0;  // Number of head_or_tp_rank values.
-        // Bytes per layer when aggregating layers, otherwise per input key.
-        uint64_t shard_bytes = 0;
+        uint64_t layer_count = 0;
+        uint64_t shard_bytes = 0;  // Bytes reserved for one layer.
     };
     // No layout: hash the original key and store slices contiguously from zero.
     std::optional<LayoutConfig> layout_;
