@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cstring>
 #include <functional>
+#include <glog/logging.h>
 #include <iterator>
 #include <limits>
 #include <mutex>
@@ -167,21 +168,45 @@ ErrorCode ToError(const kv::Status& status) {
 tl::expected<void, ErrorCode> KvClientBackend::ValidateKeyLayout(
     const VllmKey& parsed) const {
     // Only selected dimensions constrain ranks and contribute to the offset.
-    if ((layout_->pp_size != 0 &&
-         ((!parsed.has_pp_rank && layout_->pp_size != 1) ||
-          parsed.pp_rank >= layout_->pp_size)) ||
-        (layout_->pcp_size != 0 &&
-         ((!parsed.has_pcp_rank && layout_->pcp_size != 1) ||
-          parsed.pcp_rank >= layout_->pcp_size)) ||
-        (layout_->dcp_size != 0 &&
-         ((!parsed.has_dcp_rank && layout_->dcp_size != 1) ||
-          parsed.dcp_rank >= layout_->dcp_size)) ||
-        (layout_->head_or_tp_size != 0 &&
-         ((!parsed.has_head_or_tp_rank && layout_->head_or_tp_size != 1) ||
-          parsed.head_or_tp_rank >= layout_->head_or_tp_size)) ||
-        (layout_->layer_count != 0 && parsed.layer &&
-         *parsed.layer >= layout_->layer_count))
+    if (layout_->pp_size != 0 &&
+        ((!parsed.has_pp_rank && layout_->pp_size != 1) ||
+         parsed.pp_rank >= layout_->pp_size)) {
+        LOG(ERROR) << "Invalid KVClient layout rank: dimension=pp, present="
+                   << parsed.has_pp_rank << ", rank=" << parsed.pp_rank
+                   << ", size=" << layout_->pp_size;
         return tl::unexpected(ErrorCode::INVALID_KEY);
+    }
+    if (layout_->pcp_size != 0 &&
+        ((!parsed.has_pcp_rank && layout_->pcp_size != 1) ||
+         parsed.pcp_rank >= layout_->pcp_size)) {
+        LOG(ERROR) << "Invalid KVClient layout rank: dimension=pcp, present="
+                   << parsed.has_pcp_rank << ", rank=" << parsed.pcp_rank
+                   << ", size=" << layout_->pcp_size;
+        return tl::unexpected(ErrorCode::INVALID_KEY);
+    }
+    if (layout_->dcp_size != 0 &&
+        ((!parsed.has_dcp_rank && layout_->dcp_size != 1) ||
+         parsed.dcp_rank >= layout_->dcp_size)) {
+        LOG(ERROR) << "Invalid KVClient layout rank: dimension=dcp, present="
+                   << parsed.has_dcp_rank << ", rank=" << parsed.dcp_rank
+                   << ", size=" << layout_->dcp_size;
+        return tl::unexpected(ErrorCode::INVALID_KEY);
+    }
+    if (layout_->head_or_tp_size != 0 &&
+        ((!parsed.has_head_or_tp_rank && layout_->head_or_tp_size != 1) ||
+         parsed.head_or_tp_rank >= layout_->head_or_tp_size)) {
+        LOG(ERROR)
+            << "Invalid KVClient layout rank: dimension=head_or_tp, present="
+            << parsed.has_head_or_tp_rank << ", rank=" << parsed.head_or_tp_rank
+            << ", size=" << layout_->head_or_tp_size;
+        return tl::unexpected(ErrorCode::INVALID_KEY);
+    }
+    if (layout_->layer_count != 0 && parsed.layer &&
+        *parsed.layer >= layout_->layer_count) {
+        LOG(ERROR) << "Invalid KVClient layout rank: dimension=layer, rank="
+                   << *parsed.layer << ", size=" << layout_->layer_count;
+        return tl::unexpected(ErrorCode::INVALID_KEY);
+    }
     return {};
 }
 
