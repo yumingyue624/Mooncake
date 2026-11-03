@@ -63,8 +63,8 @@ class KvClientBackend final : public ExternalStoreBackend {
     struct VllmKey;
     tl::expected<VllmKey, ErrorCode> ParseVllmKey(std::string_view key) const;
     // Zero disables aggregation for a dimension; configured sizes are positive.
-    // Options use aggregation.dimensions.<key field> and
-    // aggregation.shard_bytes.
+    // aggregation.dimensions maps pp/pcp/dcp/layer/head_or_tp to axis sizes;
+    // aggregation.shard_bytes specifies the byte stride of a shard.
     struct LayoutConfig {
         uint64_t pp_size = 0;
         uint64_t pcp_size = 0;

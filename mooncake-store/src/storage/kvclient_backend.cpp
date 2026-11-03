@@ -263,11 +263,11 @@ KvClientBackend::ParseLayoutConfig(
     const std::unordered_map<std::string, std::string>& options) {
     LayoutConfig layout;
     const std::pair<const char*, uint64_t*> fields[] = {
-        {"pp_rank", &layout.pp_size},
+        {"pp", &layout.pp_size},
         {"pcp", &layout.pcp_size},
         {"dcp", &layout.dcp_size},
         {"layer", &layout.layer_count},
-        {"head_or_tp_rank", &layout.head_or_tp_size},
+        {"head_or_tp", &layout.head_or_tp_size},
     };
     // Reject obsolete layout options instead of silently changing object keys.
     for (const auto* name : {"pp_size", "pcp_size", "dcp_size", "layer_count",
