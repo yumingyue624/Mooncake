@@ -2024,6 +2024,68 @@ bool Client::RedirectToHotCache(const std::string& key,
     return true;
 }
 
+void Client::SetPutSelectionPolicy(PutSelectionPolicy policy) {
+    put_selection_policy_ = std::move(policy);
+}
+
+bool Client::ShouldPutExternal(
+    const ObjectKey& key, const std::vector<Slice>& slices, PutKind kind,
+    const ReplicateConfig* config,
+    std::span<const size_t> destination_offsets) const {
+    if (!external_store_backend_) return false;
+    if (!put_selection_policy_) return true;
+    const TenantId tenant_id(master_client_.tenant_id());
+    const PutSelectionContext context{key,
+                                      tenant_id,
+                                      kind,
+                                      CalculateSliceSize(slices),
+                                      slices.size(),
+                                      config,
+                                      destination_offsets};
+    auto selected = put_selection_policy_(context);
+    if (!selected) {
+        LOG(WARNING) << "Put selection failed; keeping dual write: "
+                     << selected.error();
+        return true;
+    }
+    return *selected;
+}
+
+tl::expected<ExternalStoreBackend::TaskHandle, ErrorCode>
+Client::SubmitExternalBatchPut(const std::vector<ObjectKey>& keys,
+                               const std::vector<std::vector<Slice>>& slices,
+                               const ReplicateConfig& config, PutKind kind,
+                               std::vector<size_t>& selected_indices) {
+    if (!external_store_backend_) return nullptr;
+    // The default policy sends the original batch without filtering or copies.
+    if (!put_selection_policy_) {
+        return external_store_backend_->BatchPutAsync(
+            keys, slices, TenantId(master_client_.tenant_id()));
+    }
+    if (config.group_ids && config.group_ids->size() != keys.size())
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    for (size_t i = 0; i < keys.size(); ++i) {
+        const auto key_config = config.ForSingleKey(i);
+        if (ShouldPutExternal(keys[i], slices[i], kind, &key_config))
+            selected_indices.push_back(i);
+    }
+    if (selected_indices.empty()) return nullptr;
+    if (selected_indices.size() == keys.size()) {
+        return external_store_backend_->BatchPutAsync(
+            keys, slices, TenantId(master_client_.tenant_id()));
+    }
+    std::vector<ObjectKey> selected_keys;
+    std::vector<std::vector<Slice>> selected_slices;
+    selected_keys.reserve(selected_indices.size());
+    selected_slices.reserve(selected_indices.size());
+    for (const auto i : selected_indices) {
+        selected_keys.push_back(keys[i]);
+        selected_slices.push_back(slices[i]);
+    }
+    return external_store_backend_->BatchPutAsync(
+        selected_keys, selected_slices, TenantId(master_client_.tenant_id()));
+}
+
 tl::expected<void, ErrorCode> Client::FinishExternalPut(
     const tl::expected<ExternalStoreBackend::TaskHandle, ErrorCode>& submission,
     tl::expected<void, ErrorCode> native_result) {
@@ -2035,7 +2097,8 @@ tl::expected<void, ErrorCode> Client::FinishExternalPut(
 // work.
 void Client::FinishExternalPut(
     const tl::expected<ExternalStoreBackend::TaskHandle, ErrorCode>& submission,
-    std::span<tl::expected<void, ErrorCode>> native_results) {
+    std::span<tl::expected<void, ErrorCode>> native_results,
+    std::span<const size_t> selected_indices) {
     if (!submission) {
         LOG(WARNING) << "External store submission failed: "
                      << submission.error();
@@ -2043,17 +2106,23 @@ void Client::FinishExternalPut(
     }
     if (!*submission) return;
     auto external = WaitExternal(*submission);
-    if (external.size() != native_results.size()) {
+    const auto expected_count = selected_indices.empty()
+                                    ? native_results.size()
+                                    : selected_indices.size();
+    if (external.size() != expected_count ||
+        std::any_of(selected_indices.begin(), selected_indices.end(),
+                    [&](size_t i) { return i >= native_results.size(); })) {
         LOG(ERROR) << "External store result count mismatch: expected="
-                   << native_results.size() << ", actual=" << external.size();
+                   << expected_count << ", actual=" << external.size();
         return;
     }
     for (size_t i = 0; i < external.size(); ++i) {
+        const auto index = selected_indices.empty() ? i : selected_indices[i];
         if (!external[i]) {
-            LOG(WARNING) << "External store operation failed at index=" << i
+            LOG(WARNING) << "External store operation failed at index=" << index
                          << ": " << external[i].error();
         } else {
-            native_results[i] = {};
+            native_results[index] = {};
         }
     }
 }
@@ -2062,7 +2131,7 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
                                           std::vector<Slice>& slices,
                                           const ReplicateConfig& config) {
     auto external =
-        external_store_backend_
+        ShouldPutExternal(key, slices, PutKind::PUT, &config)
             ? external_store_backend_->PutAsync(
                   key, slices, TenantId(master_client_.tenant_id()))
             : tl::expected<ExternalStoreBackend::TaskHandle, ErrorCode>{
@@ -2284,7 +2353,7 @@ tl::expected<void, ErrorCode> Client::Upsert(const ObjectKey& key,
                                              std::vector<Slice>& slices,
                                              const ReplicateConfig& config) {
     auto external =
-        external_store_backend_
+        ShouldPutExternal(key, slices, PutKind::UPSERT, &config)
             ? external_store_backend_->PutAsync(
                   key, slices, TenantId(master_client_.tenant_id()))
             : tl::expected<ExternalStoreBackend::TaskHandle, ErrorCode>{
@@ -2456,12 +2525,9 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchUpsert(
         return std::vector<tl::expected<void, ErrorCode>>(
             keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
     }
-    auto external =
-        external_store_backend_
-            ? external_store_backend_->BatchPutAsync(
-                  keys, batched_slices, TenantId(master_client_.tenant_id()))
-            : tl::expected<ExternalStoreBackend::TaskHandle, ErrorCode>{
-                  nullptr};
+    std::vector<size_t> selected_indices;
+    auto external = SubmitExternalBatchPut(keys, batched_slices, config,
+                                           PutKind::UPSERT, selected_indices);
     ReplicateConfig client_cfg = AttachHostId(config);
     if (protocol_ == "cxl") {
         client_cfg.preferred_segment = local_hostname_;
@@ -2472,13 +2538,15 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchUpsert(
         if (auto err = ValidatePreferSameNodeWriteConfig(client_cfg)) {
             auto native_results = std::vector<tl::expected<void, ErrorCode>>(
                 keys.size(), tl::unexpected(*err));
-            FinishExternalPut(external, std::span(native_results));
+            FinishExternalPut(external, std::span(native_results),
+                              selected_indices);
             return native_results;
         }
         StartBatchUpsert(ops, client_cfg);
         StageWriteBuffersForRemoteReplicas(ops, stager);
         auto native_results = BatchWriteWhenPreferSameNode(ops, true);
-        FinishExternalPut(external, std::span(native_results));
+        FinishExternalPut(external, std::span(native_results),
+                          selected_indices);
         return native_results;
     }
 
@@ -2497,7 +2565,7 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchUpsert(
 
     FinalizeBatchUpsert(ops);
     auto native_results = CollectResults(ops);
-    FinishExternalPut(external, std::span(native_results));
+    FinishExternalPut(external, std::span(native_results), selected_indices);
     return native_results;
 }
 
@@ -3758,12 +3826,9 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPut(
         return std::vector<tl::expected<void, ErrorCode>>(
             keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
     }
-    auto external =
-        external_store_backend_
-            ? external_store_backend_->BatchPutAsync(
-                  keys, batched_slices, TenantId(master_client_.tenant_id()))
-            : tl::expected<ExternalStoreBackend::TaskHandle, ErrorCode>{
-                  nullptr};
+    std::vector<size_t> selected_indices;
+    auto external = SubmitExternalBatchPut(keys, batched_slices, config,
+                                           PutKind::PUT, selected_indices);
     ReplicateConfig client_cfg = AttachHostId(config);
     if (protocol_ == "cxl") {
         client_cfg.preferred_segment = local_hostname_;
@@ -3774,13 +3839,15 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPut(
         if (auto err = ValidatePreferSameNodeWriteConfig(client_cfg)) {
             auto native_results = std::vector<tl::expected<void, ErrorCode>>(
                 keys.size(), tl::unexpected(*err));
-            FinishExternalPut(external, std::span(native_results));
+            FinishExternalPut(external, std::span(native_results),
+                              selected_indices);
             return native_results;
         }
         StartBatchPut(ops, client_cfg);
         StageWriteBuffersForRemoteReplicas(ops, stager);
         auto native_results = BatchWriteWhenPreferSameNode(ops, false);
-        FinishExternalPut(external, std::span(native_results));
+        FinishExternalPut(external, std::span(native_results),
+                          selected_indices);
         return native_results;
     }
     StartBatchPut(ops, client_cfg);
@@ -3799,7 +3866,7 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPut(
 
     FinalizeBatchPut(ops);
     auto native_results = CollectResults(ops);
-    FinishExternalPut(external, std::span(native_results));
+    FinishExternalPut(external, std::span(native_results), selected_indices);
     return native_results;
 }
 
