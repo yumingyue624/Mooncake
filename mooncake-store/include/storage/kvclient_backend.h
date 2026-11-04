@@ -4,9 +4,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
-#include <optional>
 #include <shared_mutex>
-#include <string_view>
 #include <unordered_set>
 #include <utility>
 
@@ -60,21 +58,6 @@ class KvClientBackend final : public ExternalStoreBackend {
     tl::expected<void, ErrorCode> UnregisterMemory(void* addr) override;
 
    private:
-    struct VllmKey;
-    tl::expected<VllmKey, ErrorCode> ParseVllmKey(std::string_view key) const;
-    // Only aggregation.dimensions.layer and aggregation.shard_bytes are used.
-    struct LayoutConfig {
-        uint64_t layer_count = 0;
-        uint64_t shard_bytes = 0;  // Bytes reserved for one layer.
-    };
-    // No layout: hash the original key and store slices contiguously from zero.
-    std::optional<LayoutConfig> layout_;
-    static tl::expected<std::optional<LayoutConfig>, ErrorCode>
-    ParseLayoutConfig(
-        const std::unordered_map<std::string, std::string>& options);
-    tl::expected<void, ErrorCode> ValidateKeyLayout(
-        const VllmKey& parsed) const;
-    uint64_t ResolveBaseOffset(const VllmKey& parsed) const;
     tl::expected<const kv::RegisteredMemory*, ErrorCode> FindRegisteredMemory(
         const Slice& slice) const;
     tl::expected<void, ErrorCode> AppendStoreEntries(
@@ -90,9 +73,8 @@ class KvClientBackend final : public ExternalStoreBackend {
     std::vector<tl::expected<void, ErrorCode>> WaitForKeyResults(
         kv::TaskId task, const std::vector<size_t>& indices,
         std::vector<tl::expected<void, ErrorCode>> results);
-    tl::expected<kv::CacheKey, ErrorCode> EncodeKey(
-        const ObjectKey& key, const TenantId& tenant_id,
-        VllmKey* parsed_key = nullptr);
+    tl::expected<kv::ResolvedKey, ErrorCode> ResolveKey(
+        const ObjectKey& key, const TenantId& tenant_id) const;
     kv::TaskResult WaitForCompletion(kv::TaskId task);
     tl::expected<TaskHandle, ErrorCode> SubmitLoads(
         const std::vector<ObjectKey>& keys,

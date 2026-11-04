@@ -1,54 +1,15 @@
 #include "storage/kvclient_backend.h"
 
 #include <algorithm>
-#include <cstring>
 #include <functional>
-#include <glog/logging.h>
 #include <iterator>
 #include <limits>
 #include <mutex>
-#include <string_view>
-#include <xxhash.h>
 #include <utility>
 
 #include "device/accelerator_registry.h"
-#include "integer_parser.h"
 
 namespace mooncake {
-
-struct KvClientBackend::VllmKey {
-    std::string storage_key;
-    std::optional<uint64_t> layer;
-};
-
-tl::expected<KvClientBackend::VllmKey, ErrorCode> KvClientBackend::ParseVllmKey(
-    std::string_view key) const {
-    VllmKey parsed{std::string(key), std::nullopt};
-    // LayerPoolKey ends with @chunk_hash@layer. Keep every other field intact.
-    // Ordinary PoolKey and SGLang keys use their original identity.
-    const auto layer_separator = key.rfind('@');
-    if (layer_separator == std::string_view::npos || layer_separator == 0)
-        return parsed;
-    const auto hash_separator = key.rfind('@', layer_separator - 1);
-    if (hash_separator == std::string_view::npos || hash_separator == 0)
-        return parsed;
-    const auto hash =
-        key.substr(hash_separator + 1, layer_separator - hash_separator - 1);
-    const auto layer_text = key.substr(layer_separator + 1);
-    if (hash.empty() || hash.find(':') != std::string_view::npos ||
-        layer_text.empty())
-        return parsed;
-    const bool numeric =
-        std::all_of(layer_text.begin(), layer_text.end(),
-                    [](char c) { return c >= '0' && c <= '9'; });
-    if (!numeric && layer_text.front() != '-' && layer_text.front() != '+')
-        return parsed;
-    const auto layer = TryParseInteger<uint64_t>(layer_text);
-    if (!layer) return tl::unexpected(ErrorCode::INVALID_KEY);
-    parsed.layer = *layer;
-    parsed.storage_key.assign(key.substr(0, layer_separator));
-    return parsed;
-}
 
 namespace {
 
@@ -85,38 +46,14 @@ ErrorCode ToError(const kv::Status& status) {
 
 }  // namespace
 
-tl::expected<void, ErrorCode> KvClientBackend::ValidateKeyLayout(
-    const VllmKey& parsed) const {
-    if (parsed.layer && *parsed.layer >= layout_->layer_count) {
-        LOG(ERROR) << "Invalid KVClient layout rank: dimension=layer, rank="
-                   << *parsed.layer << ", size=" << layout_->layer_count;
+tl::expected<kv::ResolvedKey, ErrorCode> KvClientBackend::ResolveKey(
+    const ObjectKey& key, const TenantId& tenant_id) const {
+    kv::ResolvedKey resolved;
+    const auto status = sdk_->ResolveKey(key, tenant_id.value(), resolved);
+    if (status.code == kv::StatusCode::INVALID_ARGUMENT)
         return tl::unexpected(ErrorCode::INVALID_KEY);
-    }
-    return {};
-}
-
-tl::expected<kv::CacheKey, ErrorCode> KvClientBackend::EncodeKey(
-    const ObjectKey& key, const TenantId& tenant_id, VllmKey* parsed_key) {
-    std::string identity = key;
-    if (layout_) {
-        // Reject invalid layout keys consistently for writes, reads and
-        // deletes.
-        auto parsed = ParseVllmKey(key);
-        if (!parsed) return tl::unexpected(parsed.error());
-        auto valid = ValidateKeyLayout(*parsed);
-        if (!valid) return tl::unexpected(valid.error());
-        identity = parsed->storage_key;
-        // Reuse the parsed layer when constructing transfer offsets.
-        if (parsed_key) *parsed_key = std::move(*parsed);
-    }
-    const auto scoped_key = tenant_id.MakeScopedKey(identity);
-    const uint64_t hash = XXH64(scoped_key.data(), scoped_key.size(), 0);
-    XXH64_canonical_t canonical;
-    XXH64_canonicalFromHash(&canonical, hash);
-    kv::CacheKey encoded;
-    static_assert(kv::kCacheKeySizeBytes == sizeof(canonical.digest));
-    std::memcpy(encoded.data(), canonical.digest, encoded.size());
-    return encoded;
+    if (!status.ok()) return tl::unexpected(ToError(status));
+    return resolved;
 }
 
 KvClientBackend::~KvClientBackend() { (void)Shutdown(); }
@@ -159,51 +96,10 @@ tl::expected<void, ErrorCode> KvClientBackend::Init(
     if (config == options.end()) {
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
-    auto layout = ParseLayoutConfig(options);
-    if (!layout) return tl::unexpected(layout.error());
     sdk_ = kv::CreateKvClient();
     auto status = sdk_->Init(config->second);
     if (!status.ok()) return tl::unexpected(ToError(status));
-    layout_ = *layout;
     return {};
-}
-
-tl::expected<std::optional<KvClientBackend::LayoutConfig>, ErrorCode>
-KvClientBackend::ParseLayoutConfig(
-    const std::unordered_map<std::string, std::string>& options) {
-    LayoutConfig layout;
-    // Reject obsolete flat options instead of silently changing object keys.
-    for (const auto* name : {"pp_size", "pcp_size", "dcp_size", "layer_count",
-                             "head_or_tp_size", "shard_bytes"}) {
-        if (options.contains(name))
-            return tl::unexpected(ErrorCode::INVALID_PARAMS);
-    }
-    for (const auto& [name, text] : options) {
-        uint64_t* destination = nullptr;
-        if (name == "aggregation.dimensions.layer") {
-            destination = &layout.layer_count;
-        } else if (name == "aggregation.shard_bytes") {
-            destination = &layout.shard_bytes;
-        } else if (name == "aggregation" || name.starts_with("aggregation.")) {
-            return tl::unexpected(ErrorCode::INVALID_PARAMS);
-        } else {
-            continue;
-        }
-        const auto value = TryParseInteger<uint64_t>(text);
-        if (!value || *value == 0)
-            return tl::unexpected(ErrorCode::INVALID_PARAMS);
-        *destination = *value;
-    }
-    if (layout.layer_count == 0) return std::nullopt;
-    if (layout.shard_bytes == 0 ||
-        layout.layer_count >
-            std::numeric_limits<uint64_t>::max() / layout.shard_bytes)
-        return tl::unexpected(ErrorCode::INVALID_PARAMS);
-    // SDK offsets are uint32; this is independent of storage capacity policy.
-    if (layout.layer_count * layout.shard_bytes >
-        uint64_t{std::numeric_limits<uint32_t>::max()} + 1)
-        return tl::unexpected(ErrorCode::NOT_SUPPORTED);
-    return std::optional<LayoutConfig>{layout};
 }
 
 bool KvClientBackend::SupportsMemory(
@@ -276,12 +172,12 @@ KvClientBackend::BatchExistsAsync(const std::vector<ObjectKey>& keys,
     sdk_keys.reserve(keys.size());
     indices.reserve(keys.size());
     for (size_t i = 0; i < keys.size(); ++i) {
-        auto key = EncodeKey(keys[i], tenant_id);
+        auto key = ResolveKey(keys[i], tenant_id);
         if (!key) {
             results[i] = tl::unexpected(key.error());
             continue;
         }
-        sdk_keys.push_back(*key);
+        sdk_keys.push_back(key->key);
         indices.push_back(i);
     }
     if (sdk_keys.empty()) {
@@ -363,13 +259,12 @@ KvClientBackend::SubmitLoads(
     // Keep registrations stable until the SDK accepts the descriptors.
     std::shared_lock lock(memory_mutex_);
     for (size_t i = 0; i < keys.size(); ++i) {
-        VllmKey parsed;
-        auto key = EncodeKey(keys[i], tenant_id, &parsed);
+        auto key = ResolveKey(keys[i], tenant_id);
         if (!key) {
             results[i] = tl::unexpected(key.error());
             continue;
         }
-        const auto base_offset = ResolveBaseOffset(parsed);
+        const auto base_offset = key->base_offset;
         std::vector<kv::KVBuffer> object_entries;
         if (targets[i].empty()) {
             results[i] = tl::unexpected(ErrorCode::INVALID_PARAMS);
@@ -406,7 +301,7 @@ KvClientBackend::SubmitLoads(
                 break;
             }
             kv::KVBuffer entry{};
-            entry.key = *key;
+            entry.key = key->key;
             entry.buffer.region = (*registered)->region;
             entry.buffer.handle = (*registered)->handle;
             entry.buffer.region.addr = addr;
@@ -454,10 +349,6 @@ KvClientBackend::SubmitLoads(
     });
 }
 
-uint64_t KvClientBackend::ResolveBaseOffset(const VllmKey& parsed) const {
-    return layout_ && parsed.layer ? *parsed.layer * layout_->shard_bytes : 0;
-}
-
 tl::expected<const kv::RegisteredMemory*, ErrorCode>
 KvClientBackend::FindRegisteredMemory(const Slice& slice) const {
     const auto addr = reinterpret_cast<uintptr_t>(slice.ptr);
@@ -501,13 +392,10 @@ tl::expected<void, ErrorCode> KvClientBackend::AppendStoreEntries(
                 base_offset >
                     std::numeric_limits<uint32_t>::max() - logical_offset)
                 return tl::unexpected(ErrorCode::NOT_SUPPORTED);
-            uint64_t object_offset = logical_offset;
-            uint64_t length = slice.size - consumed;
-            if (layout_) {
-                object_offset += base_offset;
-                // Split descriptors, never pad or copy source payload.
-                length = std::min(length, uint64_t{0x00fffe00});
-            }
+            const uint64_t object_offset = base_offset + logical_offset;
+            // Split descriptors, never pad or copy source payload.
+            const uint64_t length =
+                std::min(slice.size - consumed, uint64_t{0x00fffe00});
             kv::KVBuffer entry{};
             entry.key = key;
             entry.buffer.region = registered.region;
@@ -532,16 +420,15 @@ std::vector<kv::KVBuffer> KvClientBackend::BuildStoreEntries(
     std::vector<kv::KVBuffer> entries;
     results.resize(keys.size());
     for (size_t i = 0; i < keys.size(); ++i) {
-        VllmKey parsed;
-        auto key = EncodeKey(keys[i], tenant_id, &parsed);
+        auto key = ResolveKey(keys[i], tenant_id);
         if (!key) {
             results[i] = tl::unexpected(key.error());
             continue;
         }
-        const auto base_offset = ResolveBaseOffset(parsed);
+        const auto base_offset = key->base_offset;
         const auto begin = entries.size();
         results[i] = AppendStoreEntries(
-            *key, batched_slices[i], base_offset, entries,
+            key->key, batched_slices[i], base_offset, entries,
             destination_offsets ? &(*destination_offsets)[i] : nullptr);
         if (!results[i]) {
             // Do not submit a partial set of descriptors for this input key.
@@ -643,10 +530,10 @@ KvClientBackend::PutRangesAsync(
 
 tl::expected<ExternalStoreBackend::TaskHandle, ErrorCode>
 KvClientBackend::RemoveAsync(const ObjectKey& key, const TenantId& tenant_id) {
-    auto encoded = EncodeKey(key, tenant_id);
+    auto encoded = ResolveKey(key, tenant_id);
     if (!encoded) return tl::unexpected(encoded.error());
     kv::TaskId task;
-    auto submitted = sdk_->DeleteAsync({*encoded}, task);
+    auto submitted = sdk_->DeleteAsync({encoded->key}, task);
     if (!submitted.ok()) return tl::unexpected(ToError(submitted));
     return SaveTask([this, task] {
         return WaitForKeyResults(task, {0},
@@ -667,12 +554,12 @@ KvClientBackend::BatchRemoveAsync(const std::vector<ObjectKey>& keys,
     sdk_keys.reserve(keys.size());
     indices.reserve(keys.size());
     for (size_t i = 0; i < keys.size(); ++i) {
-        auto key = EncodeKey(keys[i], tenant_id);
+        auto key = ResolveKey(keys[i], tenant_id);
         if (!key) {
             results[i] = tl::unexpected(key.error());
             continue;
         }
-        sdk_keys.push_back(*key);
+        sdk_keys.push_back(key->key);
         indices.push_back(i);
     }
     if (sdk_keys.empty()) {

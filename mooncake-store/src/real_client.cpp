@@ -1018,8 +1018,9 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         }
     }
 
-    // Initialize the external backend before registering target memory.
-    if (!external_store_backend.empty()) {
+    // Client::Create may already have installed the backend from the
+    // environment.
+    if (!external_store_backend.empty() && !client_->external_store_backend_) {
         auto external_backend =
             CreateExternalStoreBackend(external_store_backend);
         if (!external_backend) {
