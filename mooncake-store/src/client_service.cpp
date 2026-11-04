@@ -52,7 +52,6 @@
 #include "config/client_numa_config.h"
 #include "storage/distributed/distributed_storage_backend.h"
 #include "storage/external_store_backend.h"
-#include "storage/external_store_backend_factory.h"
 
 namespace mooncake {
 
@@ -1146,26 +1145,6 @@ std::optional<std::shared_ptr<Client>> Client::Create(
     }
 
     client->InitTransferSubmitter();
-    // Install before RealClient or C++ callers register source/target memory.
-    const char* kvclient_config = std::getenv("MOONCAKE_KVCLIENT_CONFIG_PATH");
-    if (kvclient_config && *kvclient_config) {
-        auto backend = CreateExternalStoreBackend("kvclient");
-        if (!backend) {
-            LOG(ERROR) << "Failed to create KVClient backend: "
-                       << backend.error();
-            return std::nullopt;
-        }
-        auto installed = client->SetExternalStoreBackend(
-            *backend, {{"config_path", kvclient_config}});
-        if (!installed) {
-            LOG(ERROR) << "Failed to initialize KVClient backend, config="
-                       << kvclient_config << ", error=" << installed.error();
-            return std::nullopt;
-        }
-        LOG(INFO) << "KVClient external backend enabled, config="
-                  << kvclient_config;
-    }
-
     // Initialize local hot cache
     err = client->InitLocalHotCache();
     if (err != ErrorCode::OK) {
