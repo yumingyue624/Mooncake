@@ -110,38 +110,81 @@ class Client {
         return ReadReplicaSelector(this);
     }
 
-    // Submit optional external writes; an absent backend returns an empty
-    // guard.
+    /**
+     * @brief Submits batch writes to external storage
+     * @param keys Object keys
+     * @param sources Data slices indexed to match keys, in object byte order.
+     * Source buffers must remain valid and unchanged until the task completes.
+     * @return Task guard on submission success, or ErrorCode on failure.
+     * Returns an empty guard if keys is empty or no backend is configured.
+     */
     tl::expected<ExternalStoreTaskGuard, ErrorCode> BatchPutExternalAsync(
         const std::vector<ObjectKey>& keys,
         const std::vector<std::vector<Slice>>& sources);
 
-    // Submit ranges using offsets relative to each logical key.
+    /**
+     * @brief Submits batch range writes to external storage
+     * @param keys Object keys
+     * @param sources Data slices indexed to match keys. Source buffers must
+     * remain valid and unchanged until the task completes.
+     * @param destination_offsets Byte offsets relative to each logical key,
+     * indexed to match sources
+     * @return Task guard on submission success, or ErrorCode on failure.
+     * Returns an empty guard if keys is empty or no backend is configured.
+     */
     tl::expected<ExternalStoreTaskGuard, ErrorCode> BatchPutExternalRangesAsync(
         const std::vector<ObjectKey>& keys,
         const std::vector<std::vector<Slice>>& sources,
         const std::vector<std::vector<size_t>>& destination_offsets);
 
-    // Submit optional external deletes independently of native leases.
+    /**
+     * @brief Submits external deletes independently of native replica leases
+     * @param keys Object keys to remove
+     * @return Task guard on submission success, or ErrorCode on failure.
+     * Returns an empty guard if keys is empty or no backend is configured.
+     */
     tl::expected<ExternalStoreTaskGuard, ErrorCode> BatchRemoveExternalAsync(
         const std::vector<ObjectKey>& keys);
 
-    // Wait for external deletion and log failures without changing native
-    // results.
+    /**
+     * @brief Waits for external deletes and logs failures
+     * @param submission External submission result; an accepted task is
+     * consumed Native deletion results are not modified by external failures.
+     */
     void CompleteExternalRemove(
         tl::expected<ExternalStoreTaskGuard, ErrorCode>& submission);
 
-    // Wait and merge results per key; either successful storage path is
-    // sufficient.
+    /**
+     * @brief Waits for an external write and merges its result with native IO
+     * @param submission External submission result; an accepted task is
+     * consumed
+     * @param native_result Native write result
+     * @return Success if either storage path succeeds; otherwise the native
+     * error. An empty guard leaves the native result unchanged.
+     */
     tl::expected<void, ErrorCode> CompleteExternalPut(
         tl::expected<ExternalStoreTaskGuard, ErrorCode>& submission,
         tl::expected<void, ErrorCode> native_result = {});
+    /**
+     * @brief Waits for external writes and merges results per key
+     * @param submission External submission result; an accepted task is
+     * consumed
+     * @param native_results Native results updated in input key order. Each key
+     * succeeds if either storage path succeeds; otherwise its native error is
+     * preserved. An empty guard leaves all native results unchanged.
+     */
     void CompleteExternalPut(
         tl::expected<ExternalStoreTaskGuard, ErrorCode>& submission,
         std::span<tl::expected<void, ErrorCode>> native_results);
 
-    // Merge range-write results, reporting logical bytes if only external IO
-    // succeeds.
+    /**
+     * @brief Waits for external range writes and merges results per key
+     * @param submission External submission result; an accepted task is
+     * consumed
+     * @param slices Source slices indexed to match the native results
+     * @param transfer Native results updated in place. Native successes retain
+     * their byte counts; external-only successes report the sum of slice sizes.
+     */
     void CompleteExternalRangePut(
         tl::expected<ExternalStoreTaskGuard, ErrorCode>& submission,
         const std::vector<std::vector<Slice>>& slices,
