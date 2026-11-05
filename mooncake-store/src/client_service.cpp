@@ -2283,19 +2283,12 @@ bool Client::healDanglingLocalDiskReplica(const ObjectKey& key) {
 tl::expected<void, ErrorCode> Client::Upsert(const ObjectKey& key,
                                              std::vector<Slice>& slices,
                                              const ReplicateConfig& config) {
-    auto external =
-        external_store_backend_
-            ? external_store_backend_->BatchPutAsync(
-                  {key}, {slices}, TenantId(master_client_.tenant_id()))
-            : tl::expected<ExternalStoreBackend::TaskHandle, ErrorCode>{
-                  nullptr};
     std::optional<uint64_t> object_checksum;
     if (object_checksum_enabled_) {
         auto checksum_result = ComputeObjectChecksumForSlices(
             key, slices, CalculateSliceSize(slices));
         if (!checksum_result) {
-            return FinishExternalPut(external,
-                                     tl::unexpected(checksum_result.error()));
+            return tl::unexpected(checksum_result.error());
         }
         object_checksum = *checksum_result;
     }
@@ -2327,7 +2320,7 @@ tl::expected<void, ErrorCode> Client::Upsert(const ObjectKey& key,
             LOG(ERROR) << "Failed to start upsert operation for key=" << key
                        << ": " << toString(err);
         }
-        return FinishExternalPut(external, tl::unexpected(err));
+        return tl::unexpected(err);
     }
 
     ReplicaTransferSummary transfer_summary;
@@ -2413,7 +2406,7 @@ tl::expected<void, ErrorCode> Client::Upsert(const ObjectKey& key,
         if (!end_result) {
             ErrorCode err = end_result.error();
             LOG(ERROR) << "Failed to end upsert operation: " << err;
-            return FinishExternalPut(external, tl::unexpected(err));
+            return tl::unexpected(err);
         }
     }
     if (finalize_decision.revoke_type.has_value()) {
@@ -2421,13 +2414,11 @@ tl::expected<void, ErrorCode> Client::Upsert(const ObjectKey& key,
             master_client_.UpsertRevoke(key, *finalize_decision.revoke_type);
         if (!revoke_result) {
             LOG(ERROR) << "Failed to revoke upsert operation";
-            return FinishExternalPut(external,
-                                     tl::unexpected(revoke_result.error()));
+            return tl::unexpected(revoke_result.error());
         }
     }
     if (!finalize_decision.success) {
-        return FinishExternalPut(external,
-                                 tl::unexpected(finalize_decision.error));
+        return tl::unexpected(finalize_decision.error);
     }
 
     // Success-side invalidation: a concurrent read between the pre-upsert
@@ -2438,7 +2429,7 @@ tl::expected<void, ErrorCode> Client::Upsert(const ObjectKey& key,
         hot_cache_->RemoveHotKey(key);
     }
 
-    return FinishExternalPut(external);
+    return {};
 }
 
 std::vector<tl::expected<void, ErrorCode>> Client::BatchUpsert(
@@ -2452,16 +2443,6 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchUpsert(
     const std::vector<ObjectKey>& keys,
     std::vector<std::vector<Slice>>& batched_slices,
     const ReplicateConfig& config, const WriteBufferStager& stager) {
-    if (keys.size() != batched_slices.size()) {
-        return std::vector<tl::expected<void, ErrorCode>>(
-            keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
-    }
-    auto external =
-        external_store_backend_
-            ? external_store_backend_->BatchPutAsync(
-                  keys, batched_slices, TenantId(master_client_.tenant_id()))
-            : tl::expected<ExternalStoreBackend::TaskHandle, ErrorCode>{
-                  nullptr};
     ReplicateConfig client_cfg = AttachHostId(config);
     if (protocol_ == "cxl") {
         client_cfg.preferred_segment = local_hostname_;
@@ -2470,16 +2451,12 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchUpsert(
     ComputeBatchObjectChecksums(ops);
     if (client_cfg.prefer_alloc_in_same_node) {
         if (auto err = ValidatePreferSameNodeWriteConfig(client_cfg)) {
-            auto native_results = std::vector<tl::expected<void, ErrorCode>>(
+            return std::vector<tl::expected<void, ErrorCode>>(
                 keys.size(), tl::unexpected(*err));
-            FinishExternalPut(external, std::span(native_results));
-            return native_results;
         }
         StartBatchUpsert(ops, client_cfg);
         StageWriteBuffersForRemoteReplicas(ops, stager);
-        auto native_results = BatchWriteWhenPreferSameNode(ops, true);
-        FinishExternalPut(external, std::span(native_results));
-        return native_results;
+        return BatchWriteWhenPreferSameNode(ops, true);
     }
 
     StartBatchUpsert(ops, client_cfg);
@@ -2496,9 +2473,7 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchUpsert(
     }
 
     FinalizeBatchUpsert(ops);
-    auto native_results = CollectResults(ops);
-    FinishExternalPut(external, std::span(native_results));
-    return native_results;
+    return CollectResults(ops);
 }
 
 // TODO: `client.cpp` is too long, consider split it into multiple files
