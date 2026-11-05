@@ -147,44 +147,22 @@ class Client {
         const std::vector<ObjectKey>& keys);
 
     /**
-     * @brief Waits for external deletes and logs failures
-     * @param submission External submission result; an accepted task is
-     * consumed Native deletion results are not modified by external failures.
+     * @brief Helper methods for completing external storage operations
+     *
+     * Accepted tasks are waited and consumed; empty guards leave native
+     * results unchanged. Put succeeds per key if either storage path succeeds;
+     * otherwise the native error is preserved. Range writes retain native byte
+     * counts, or report the sum of slice sizes when only external IO succeeds.
+     * Remove logs external failures without changing native deletion results.
      */
     void CompleteExternalRemove(
         tl::expected<ExternalStoreTaskGuard, ErrorCode>& submission);
-
-    /**
-     * @brief Waits for an external write and merges its result with native IO
-     * @param submission External submission result; an accepted task is
-     * consumed
-     * @param native_result Native write result
-     * @return Success if either storage path succeeds; otherwise the native
-     * error. An empty guard leaves the native result unchanged.
-     */
     tl::expected<void, ErrorCode> CompleteExternalPut(
         tl::expected<ExternalStoreTaskGuard, ErrorCode>& submission,
         tl::expected<void, ErrorCode> native_result = {});
-    /**
-     * @brief Waits for external writes and merges results per key
-     * @param submission External submission result; an accepted task is
-     * consumed
-     * @param native_results Native results updated in input key order. Each key
-     * succeeds if either storage path succeeds; otherwise its native error is
-     * preserved. An empty guard leaves all native results unchanged.
-     */
     void CompleteExternalPut(
         tl::expected<ExternalStoreTaskGuard, ErrorCode>& submission,
         std::span<tl::expected<void, ErrorCode>> native_results);
-
-    /**
-     * @brief Waits for external range writes and merges results per key
-     * @param submission External submission result; an accepted task is
-     * consumed
-     * @param slices Source slices indexed to match the native results
-     * @param transfer Native results updated in place. Native successes retain
-     * their byte counts; external-only successes report the sum of slice sizes.
-     */
     void CompleteExternalRangePut(
         tl::expected<ExternalStoreTaskGuard, ErrorCode>& submission,
         const std::vector<std::vector<Slice>>& slices,
