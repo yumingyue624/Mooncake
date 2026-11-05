@@ -25,10 +25,7 @@ class ExternalStoreBackend {
     // resources, including registered memory. Repeated shutdown is safe.
     virtual tl::expected<void, ErrorCode> Shutdown() = 0;
     // Source memory must remain valid and unchanged until Wait returns.
-    // Slices describe one object in input order.
-    virtual tl::expected<TaskHandle, ErrorCode> PutAsync(
-        const ObjectKey& key, const std::vector<Slice>& slices,
-        const TenantId& tenant_id) = 0;
+    // Slices describe each object in input order.
     // batched_slices[i] belongs to keys[i]; Wait preserves input key order.
     virtual tl::expected<TaskHandle, ErrorCode> BatchPutAsync(
         const std::vector<ObjectKey>& keys,
@@ -41,8 +38,6 @@ class ExternalStoreBackend {
         const std::vector<std::vector<size_t>>& destination_offsets,
         const TenantId& tenant_id) = 0;
     // Remove the external object independently of native replica leases.
-    virtual tl::expected<TaskHandle, ErrorCode> RemoveAsync(
-        const ObjectKey& key, const TenantId& tenant_id) = 0;
     virtual tl::expected<TaskHandle, ErrorCode> BatchRemoveAsync(
         const std::vector<ObjectKey>& keys, const TenantId& tenant_id) = 0;
 

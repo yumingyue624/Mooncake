@@ -459,24 +459,6 @@ std::vector<tl::expected<void, ErrorCode>> KvClientBackend::WaitForKeyResults(
 }
 
 tl::expected<ExternalStoreBackend::TaskHandle, ErrorCode>
-KvClientBackend::PutAsync(const ObjectKey& key,
-                          const std::vector<Slice>& slices,
-                          const TenantId& tenant_id) {
-    std::vector<size_t> indices;
-    std::vector<tl::expected<void, ErrorCode>> results;
-    auto entries =
-        BuildStoreEntries(tenant_id, {key}, {slices}, indices, results);
-    if (!results.front()) return tl::unexpected(results.front().error());
-    kv::TaskId task;
-    auto submitted = sdk_->StoreAsync(entries, task);
-    if (!submitted.ok()) return tl::unexpected(ToError(submitted));
-    return SaveTask([this, task, indices = std::move(indices),
-                     results = std::move(results)]() mutable {
-        return WaitForKeyResults(task, indices, std::move(results));
-    });
-}
-
-tl::expected<ExternalStoreBackend::TaskHandle, ErrorCode>
 KvClientBackend::BatchPutAsync(
     const std::vector<ObjectKey>& keys,
     const std::vector<std::vector<Slice>>& batched_slices,
@@ -525,19 +507,6 @@ KvClientBackend::PutRangesAsync(
     return SaveTask([this, task, indices = std::move(indices),
                      results = std::move(results)]() mutable {
         return WaitForKeyResults(task, indices, std::move(results));
-    });
-}
-
-tl::expected<ExternalStoreBackend::TaskHandle, ErrorCode>
-KvClientBackend::RemoveAsync(const ObjectKey& key, const TenantId& tenant_id) {
-    auto encoded = ResolveKey(key, tenant_id);
-    if (!encoded) return tl::unexpected(encoded.error());
-    kv::TaskId task;
-    auto submitted = sdk_->DeleteAsync({encoded->key}, task);
-    if (!submitted.ok()) return tl::unexpected(ToError(submitted));
-    return SaveTask([this, task] {
-        return WaitForKeyResults(task, {0},
-                                 std::vector<tl::expected<void, ErrorCode>>(1));
     });
 }
 

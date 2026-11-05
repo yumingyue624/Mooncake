@@ -2063,8 +2063,8 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
                                           const ReplicateConfig& config) {
     auto external =
         external_store_backend_
-            ? external_store_backend_->PutAsync(
-                  key, slices, TenantId(master_client_.tenant_id()))
+            ? external_store_backend_->BatchPutAsync(
+                  {key}, {slices}, TenantId(master_client_.tenant_id()))
             : tl::expected<ExternalStoreBackend::TaskHandle, ErrorCode>{
                   nullptr};
     std::optional<uint64_t> object_checksum;
@@ -2285,8 +2285,8 @@ tl::expected<void, ErrorCode> Client::Upsert(const ObjectKey& key,
                                              const ReplicateConfig& config) {
     auto external =
         external_store_backend_
-            ? external_store_backend_->PutAsync(
-                  key, slices, TenantId(master_client_.tenant_id()))
+            ? external_store_backend_->BatchPutAsync(
+                  {key}, {slices}, TenantId(master_client_.tenant_id()))
             : tl::expected<ExternalStoreBackend::TaskHandle, ErrorCode>{
                   nullptr};
     std::optional<uint64_t> object_checksum;
@@ -3868,8 +3868,8 @@ void Client::FinishExternalRemove(
 tl::expected<void, ErrorCode> Client::Remove(const ObjectKey& key, bool force) {
     auto external =
         external_store_backend_
-            ? external_store_backend_->RemoveAsync(
-                  key, TenantId(master_client_.tenant_id()))
+            ? external_store_backend_->BatchRemoveAsync(
+                  {key}, TenantId(master_client_.tenant_id()))
             : tl::expected<ExternalStoreBackend::TaskHandle, ErrorCode>{
                   nullptr};
     if (hot_cache_) {
