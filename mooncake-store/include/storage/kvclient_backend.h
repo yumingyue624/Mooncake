@@ -20,6 +20,18 @@ class KvClientBackend final : public ExternalStoreBackend {
     tl::expected<void, ErrorCode> Init(
         const std::unordered_map<std::string, std::string>& options) override;
     tl::expected<void, ErrorCode> Shutdown() override;
+    tl::expected<TaskHandle, ErrorCode> BatchPutAsync(
+        const std::vector<ObjectKey>& keys,
+        const std::vector<std::vector<Slice>>& batched_slices,
+        const TenantId& tenant_id) override;
+    tl::expected<TaskHandle, ErrorCode> PutRangesAsync(
+        const std::vector<ObjectKey>& keys,
+        const std::vector<std::vector<Slice>>& sources,
+        const std::vector<std::vector<size_t>>& destination_offsets,
+        const TenantId& tenant_id) override;
+    tl::expected<TaskHandle, ErrorCode> BatchRemoveAsync(
+        const std::vector<ObjectKey>& keys, const TenantId& tenant_id) override;
+
     tl::expected<TaskHandle, ErrorCode> BatchExistsAsync(
         const std::vector<ObjectKey>& keys, const TenantId& tenant_id,
         std::vector<uint8_t>* exists) override;
@@ -41,7 +53,23 @@ class KvClientBackend final : public ExternalStoreBackend {
     tl::expected<void, ErrorCode> UnregisterMemory(void* addr) override;
 
    private:
-    kv::CacheKey EncodeKey(const ObjectKey& key, const TenantId& tenant_id);
+    tl::expected<const kv::RegisteredMemory*, ErrorCode> FindRegisteredMemory(
+        const Slice& slice) const;
+    tl::expected<void, ErrorCode> AppendStoreEntries(
+        const kv::CacheKey& key, const std::vector<Slice>& slices,
+        uint64_t base_offset, std::vector<kv::KVBuffer>& entries,
+        const std::vector<size_t>* destination_offsets = nullptr);
+    std::vector<kv::KVBuffer> BuildStoreEntries(
+        const TenantId& tenant_id, const std::vector<ObjectKey>& keys,
+        const std::vector<std::vector<Slice>>& batched_slices,
+        std::vector<size_t>& indices,
+        std::vector<tl::expected<void, ErrorCode>>& results,
+        const std::vector<std::vector<size_t>>* destination_offsets = nullptr);
+    std::vector<tl::expected<void, ErrorCode>> WaitForKeyResults(
+        kv::TaskId task, const std::vector<size_t>& indices,
+        std::vector<tl::expected<void, ErrorCode>> results);
+    tl::expected<kv::ResolvedKey, ErrorCode> ResolveKey(
+        const ObjectKey& key, const TenantId& tenant_id) const;
     kv::TaskResult WaitForCompletion(kv::TaskId task);
     tl::expected<TaskHandle, ErrorCode> SubmitLoads(
         const std::vector<ObjectKey>& keys,

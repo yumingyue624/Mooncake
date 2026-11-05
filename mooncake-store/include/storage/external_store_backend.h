@@ -24,6 +24,22 @@ class ExternalStoreBackend {
     // Call after client operations stop. Drain tasks and release backend
     // resources, including registered memory. Repeated shutdown is safe.
     virtual tl::expected<void, ErrorCode> Shutdown() = 0;
+    // Source memory must remain valid and unchanged until Wait returns.
+    // Slices describe each object in input order.
+    // batched_slices[i] belongs to keys[i]; Wait preserves input key order.
+    virtual tl::expected<TaskHandle, ErrorCode> BatchPutAsync(
+        const std::vector<ObjectKey>& keys,
+        const std::vector<std::vector<Slice>>& batched_slices,
+        const TenantId& tenant_id) = 0;
+    // Write each source slice at its corresponding key-relative byte offset.
+    virtual tl::expected<TaskHandle, ErrorCode> PutRangesAsync(
+        const std::vector<ObjectKey>& keys,
+        const std::vector<std::vector<Slice>>& sources,
+        const std::vector<std::vector<size_t>>& destination_offsets,
+        const TenantId& tenant_id) = 0;
+    // Remove the external object independently of native replica leases.
+    virtual tl::expected<TaskHandle, ErrorCode> BatchRemoveAsync(
+        const std::vector<ObjectKey>& keys, const TenantId& tenant_id) = 0;
 
     // exists is non-null and stays valid until Wait returns.
     // Successful query items report 0 (missing) or 1 (present).
