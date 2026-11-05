@@ -1062,6 +1062,20 @@ class Client {
     tl::expected<void, ErrorCode> InitExternalStoreBackendFromEnvironment();
     tl::expected<ExternalStoreTaskGuard, ErrorCode> BatchExistsExternalAsync(
         const std::vector<ObjectKey>& keys, std::vector<uint8_t>* exists);
+    friend class RealClient;
+    void FinishExternalRemove(
+        const tl::expected<ExternalStoreBackend::TaskHandle, ErrorCode>&
+            submission);
+    tl::expected<void, ErrorCode> FinishExternalPut(
+        const tl::expected<ExternalStoreBackend::TaskHandle, ErrorCode>&
+            submission,
+        tl::expected<void, ErrorCode> native_result = {});
+    void FinishExternalPut(
+        const tl::expected<ExternalStoreBackend::TaskHandle, ErrorCode>&
+            submission,
+        std::span<tl::expected<void, ErrorCode>> native_results);
+    std::vector<tl::expected<void, ErrorCode>> WaitExternal(
+        ExternalStoreBackend::TaskHandle task);
     /**
      * @brief Internal helper functions for initialization and data transfer
      */
