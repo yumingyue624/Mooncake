@@ -8206,6 +8206,10 @@ std::vector<int> RealClient::batch_put_from_multi_buffer_ranges(
     std::vector<std::vector<uint64_t>> dst_offsets;
     std::vector<size_t> idx_map;
     std::vector<std::string> inflight_keys;
+    std::vector<ObjectKey> external_keys;
+    std::vector<std::vector<size_t>> external_offsets;
+    external_keys.reserve(keys.size());
+    external_offsets.reserve(keys.size());
 
     {
         std::lock_guard<std::mutex> lock(session_mutex_);
@@ -8245,6 +8249,8 @@ std::vector<int> RealClient::batch_put_from_multi_buffer_ranges(
             slices.push_back(std::move(entry_slices));
             dst_offsets.push_back(std::move(entry_offsets));
             idx_map.push_back(i);
+            external_keys.push_back(keys[i]);
+            external_offsets.push_back(offsets);
         }
     }
 
@@ -8273,33 +8279,12 @@ std::vector<int> RealClient::batch_put_from_multi_buffer_ranges(
         }
     } inflight_guard{this, std::move(inflight_keys)};
 
-    std::vector<ObjectKey> external_keys;
-    std::vector<std::vector<size_t>> external_offsets;
-    external_keys.reserve(idx_map.size());
-    external_offsets.reserve(idx_map.size());
-    for (const auto i : idx_map) {
-        external_keys.push_back(keys[i]);
-        external_offsets.push_back(all_dst_offsets[i]);
-    }
     auto external = client_->BatchPutExternalRangesAsync(external_keys, slices,
                                                          external_offsets);
 
     auto transfer = client_->BatchTransferWriteRanges(replicas_per_entry,
                                                       slices, dst_offsets);
-    std::vector<tl::expected<void, ErrorCode>> statuses(transfer.size());
-    for (size_t i = 0; i < transfer.size(); ++i) {
-        if (!transfer[i]) statuses[i] = tl::unexpected(transfer[i].error());
-    }
-    client_->CompleteExternalPut(external, std::span(statuses));
-    for (size_t i = 0; i < transfer.size(); ++i) {
-        if (!transfer[i] && statuses[i]) {
-            // Count logical bytes once when only the external write
-            // succeeds.
-            int64_t bytes = 0;
-            for (const auto &slice : slices[i]) bytes += slice.size;
-            transfer[i] = bytes;
-        }
-    }
+    client_->CompleteExternalRangePut(external, slices, transfer);
     for (size_t k = 0; k < transfer.size(); ++k) {
         results[idx_map[k]] = std::move(transfer[k]);
     }

@@ -203,6 +203,26 @@ void Client::CompleteExternalPut(
     }
 }
 
+void Client::CompleteExternalRangePut(
+    tl::expected<ExternalStoreTaskGuard, ErrorCode>& submission,
+    const std::vector<std::vector<Slice>>& slices,
+    std::vector<tl::expected<int64_t, ErrorCode>>& transfer) {
+    std::vector<tl::expected<void, ErrorCode>> statuses(transfer.size());
+    for (size_t i = 0; i < transfer.size(); ++i) {
+        if (!transfer[i]) statuses[i] = tl::unexpected(transfer[i].error());
+    }
+    CompleteExternalPut(submission, std::span(statuses));
+    for (size_t i = 0; i < transfer.size(); ++i) {
+        if (!transfer[i] && statuses[i]) {
+            // Count logical bytes once when only the external write
+            // succeeds.
+            int64_t bytes = 0;
+            for (const auto& slice : slices[i]) bytes += slice.size;
+            transfer[i] = bytes;
+        }
+    }
+}
+
 // Drain external deletes for diagnostics; callers return the native result.
 void Client::CompleteExternalRemove(
     tl::expected<ExternalStoreTaskGuard, ErrorCode>& submission) {

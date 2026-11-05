@@ -127,7 +127,10 @@ class Client {
     void CompleteExternalPut(
         tl::expected<ExternalStoreTaskGuard, ErrorCode>& submission,
         std::span<tl::expected<void, ErrorCode>> native_results);
-
+    void CompleteExternalRangePut(
+        tl::expected<ExternalStoreTaskGuard, ErrorCode>& submission,
+        const std::vector<std::vector<Slice>>& slices,
+        std::vector<tl::expected<int64_t, ErrorCode>>& transfer);
     using WriteBufferStager =
         std::function<tl::expected<std::vector<Slice>, ErrorCode>(
             const std::vector<Slice>&)>;

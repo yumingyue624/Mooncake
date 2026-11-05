@@ -31,7 +31,6 @@ class KvClientBackend final : public ExternalStoreBackend {
         const TenantId& tenant_id) override;
     tl::expected<TaskHandle, ErrorCode> BatchRemoveAsync(
         const std::vector<ObjectKey>& keys, const TenantId& tenant_id) override;
-
     tl::expected<TaskHandle, ErrorCode> BatchExistsAsync(
         const std::vector<ObjectKey>& keys, const TenantId& tenant_id,
         std::vector<uint8_t>* exists) override;
