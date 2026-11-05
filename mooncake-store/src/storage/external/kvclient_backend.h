@@ -20,6 +20,7 @@ class KvClientBackend final : public ExternalStoreBackend {
     tl::expected<void, ErrorCode> Init(
         const std::unordered_map<std::string, std::string>& options) override;
     tl::expected<void, ErrorCode> Shutdown() override;
+
     tl::expected<TaskHandle, ErrorCode> BatchPutAsync(
         const std::vector<ObjectKey>& keys,
         const std::vector<std::vector<Slice>>& batched_slices,
@@ -31,6 +32,7 @@ class KvClientBackend final : public ExternalStoreBackend {
         const TenantId& tenant_id) override;
     tl::expected<TaskHandle, ErrorCode> BatchRemoveAsync(
         const std::vector<ObjectKey>& keys, const TenantId& tenant_id) override;
+
     tl::expected<TaskHandle, ErrorCode> BatchExistsAsync(
         const std::vector<ObjectKey>& keys, const TenantId& tenant_id,
         std::vector<uint8_t>* exists) override;
@@ -52,21 +54,30 @@ class KvClientBackend final : public ExternalStoreBackend {
    private:
     tl::expected<const kv::RegisteredMemory*, ErrorCode> FindRegisteredMemory(
         const Slice& slice) const;
+
+    // Append one key's slices in input order, splitting descriptors as needed.
     tl::expected<void, ErrorCode> AppendStoreEntries(
         const kv::CacheKey& key, const std::vector<Slice>& slices,
         uint64_t base_offset, std::vector<kv::KVBuffer>& entries,
         const std::vector<size_t>* destination_offsets = nullptr);
+
+    // Build descriptors and map each entry back to its input key index.
     std::vector<kv::KVBuffer> BuildStoreEntries(
         const std::vector<ObjectKey>& keys,
         const std::vector<std::vector<Slice>>& batched_slices,
         const TenantId& tenant_id, std::vector<size_t>& indices,
         std::vector<tl::expected<void, ErrorCode>>& results,
         const std::vector<std::vector<size_t>>* destination_offsets = nullptr);
+
+    // Reduce SDK entry results to one completion status per input key.
     std::vector<tl::expected<void, ErrorCode>> WaitForKeyResults(
         kv::TaskId task, const std::vector<size_t>& indices,
         std::vector<tl::expected<void, ErrorCode>> results);
+
+    // Delegate object identity and base offset mapping to the SDK.
     tl::expected<kv::ResolvedKey, ErrorCode> ResolveKey(
         const ObjectKey& key, const TenantId& tenant_id) const;
+
     kv::TaskResult WaitForCompletion(kv::TaskId task);
     tl::expected<TaskHandle, ErrorCode> SubmitLoads(
         const std::vector<ObjectKey>& keys,

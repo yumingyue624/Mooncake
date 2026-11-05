@@ -133,7 +133,6 @@ std::vector<tl::expected<bool, ErrorCode>> Client::BatchExistsExternal(
     return results;
 }
 
-// An absent backend is a no-op for the optional external write/delete path.
 tl::expected<ExternalStoreTaskGuard, ErrorCode> Client::BatchPutExternalAsync(
     const std::vector<ObjectKey>& keys,
     const std::vector<std::vector<Slice>>& sources) {

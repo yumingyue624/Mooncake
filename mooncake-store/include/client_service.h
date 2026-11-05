@@ -110,27 +110,43 @@ class Client {
         return ReadReplicaSelector(this);
     }
 
+    // Submit optional external writes; an absent backend returns an empty
+    // guard.
     tl::expected<ExternalStoreTaskGuard, ErrorCode> BatchPutExternalAsync(
         const std::vector<ObjectKey>& keys,
         const std::vector<std::vector<Slice>>& sources);
+
+    // Submit ranges using offsets relative to each logical key.
     tl::expected<ExternalStoreTaskGuard, ErrorCode> BatchPutExternalRangesAsync(
         const std::vector<ObjectKey>& keys,
         const std::vector<std::vector<Slice>>& sources,
         const std::vector<std::vector<size_t>>& destination_offsets);
+
+    // Submit optional external deletes independently of native leases.
     tl::expected<ExternalStoreTaskGuard, ErrorCode> BatchRemoveExternalAsync(
         const std::vector<ObjectKey>& keys);
+
+    // Wait for external deletion and log failures without changing native
+    // results.
     void CompleteExternalRemove(
         tl::expected<ExternalStoreTaskGuard, ErrorCode>& submission);
+
+    // Wait and merge results per key; either successful storage path is
+    // sufficient.
     tl::expected<void, ErrorCode> CompleteExternalPut(
         tl::expected<ExternalStoreTaskGuard, ErrorCode>& submission,
         tl::expected<void, ErrorCode> native_result = {});
     void CompleteExternalPut(
         tl::expected<ExternalStoreTaskGuard, ErrorCode>& submission,
         std::span<tl::expected<void, ErrorCode>> native_results);
+
+    // Merge range-write results, reporting logical bytes if only external IO
+    // succeeds.
     void CompleteExternalRangePut(
         tl::expected<ExternalStoreTaskGuard, ErrorCode>& submission,
         const std::vector<std::vector<Slice>>& slices,
         std::vector<tl::expected<int64_t, ErrorCode>>& transfer);
+
     using WriteBufferStager =
         std::function<tl::expected<std::vector<Slice>, ErrorCode>(
             const std::vector<Slice>&)>;
