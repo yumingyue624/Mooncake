@@ -402,9 +402,16 @@ tl::expected<void, ErrorCode> KvClientBackend::AppendStoreEntries(
     const kv::CacheKey& key, const std::vector<Slice>& slices,
     uint64_t base_offset, std::vector<kv::KVBuffer>& entries,
     const std::vector<size_t>* destination_offsets) {
-    if (slices.empty()) return tl::unexpected(ErrorCode::INVALID_PARAMS);
-    if (destination_offsets && destination_offsets->size() != slices.size())
+    if (slices.empty()) {
+        LOG(WARNING) << "Missing KVClient store sources";
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    if (destination_offsets && destination_offsets->size() != slices.size()) {
+        LOG(WARNING) << "KVClient store range count mismatch, slices="
+                     << slices.size()
+                     << ", offsets=" << destination_offsets->size();
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
     // Preserve slice order even when the source addresses are noncontiguous.
     uint64_t logical_offset = 0;
     for (size_t i = 0; i < slices.size(); ++i) {
@@ -414,7 +421,13 @@ tl::expected<void, ErrorCode> KvClientBackend::AppendStoreEntries(
         {
             std::shared_lock lock(memory_mutex_);
             auto region = FindRegisteredMemory(slice);
-            if (!region) return tl::unexpected(region.error());
+            if (!region) {
+                LOG(WARNING)
+                    << "Invalid KVClient store source, slice=" << i
+                    << ", addr=" << slice.ptr << ", size=" << slice.size
+                    << ", error=" << static_cast<int>(region.error());
+                return tl::unexpected(region.error());
+            }
             // Keep a snapshot; the map entry may be erased after unlocking.
             registered = **region;
         }
@@ -423,8 +436,13 @@ tl::expected<void, ErrorCode> KvClientBackend::AppendStoreEntries(
         while (consumed < slice.size) {
             if (logical_offset > std::numeric_limits<uint32_t>::max() ||
                 base_offset >
-                    std::numeric_limits<uint32_t>::max() - logical_offset)
+                    std::numeric_limits<uint32_t>::max() - logical_offset) {
+                LOG(WARNING)
+                    << "KVClient store exceeds SDK offset limits, slice=" << i
+                    << ", base_offset=" << base_offset
+                    << ", logical_offset=" << logical_offset;
                 return tl::unexpected(ErrorCode::NOT_SUPPORTED);
+            }
             const uint64_t object_offset = base_offset + logical_offset;
             // Split descriptors, never pad or copy source payload.
             const uint64_t length =
@@ -445,9 +463,9 @@ tl::expected<void, ErrorCode> KvClientBackend::AppendStoreEntries(
 }
 
 std::vector<kv::KVBuffer> KvClientBackend::BuildStoreEntries(
-    const TenantId& tenant_id, const std::vector<ObjectKey>& keys,
+    const std::vector<ObjectKey>& keys,
     const std::vector<std::vector<Slice>>& batched_slices,
-    std::vector<size_t>& indices,
+    const TenantId& tenant_id, std::vector<size_t>& indices,
     std::vector<tl::expected<void, ErrorCode>>& results,
     const std::vector<std::vector<size_t>>* destination_offsets) {
     std::vector<kv::KVBuffer> entries;
@@ -455,6 +473,9 @@ std::vector<kv::KVBuffer> KvClientBackend::BuildStoreEntries(
     for (size_t i = 0; i < keys.size(); ++i) {
         auto key = ResolveKey(keys[i], tenant_id);
         if (!key) {
+            LOG(WARNING) << "Invalid KVClient store key, index=" << i
+                         << ", key=" << keys[i]
+                         << ", error=" << static_cast<int>(key.error());
             results[i] = tl::unexpected(key.error());
             continue;
         }
@@ -464,6 +485,9 @@ std::vector<kv::KVBuffer> KvClientBackend::BuildStoreEntries(
             key->key, batched_slices[i], base_offset, entries,
             destination_offsets ? &(*destination_offsets)[i] : nullptr);
         if (!results[i]) {
+            LOG(WARNING) << "Invalid KVClient store sources, index=" << i
+                         << ", key=" << keys[i]
+                         << ", error=" << static_cast<int>(results[i].error());
             // Do not submit a partial set of descriptors for this input key.
             entries.resize(begin);
             continue;
@@ -496,12 +520,16 @@ KvClientBackend::BatchPutAsync(
     const std::vector<ObjectKey>& keys,
     const std::vector<std::vector<Slice>>& batched_slices,
     const TenantId& tenant_id) {
-    if (keys.size() != batched_slices.size())
+    if (keys.size() != batched_slices.size()) {
+        LOG(WARNING) << "Invalid KVClient batch store arguments, keys="
+                     << keys.size()
+                     << ", batched_slices=" << batched_slices.size();
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
     std::vector<size_t> indices;
     std::vector<tl::expected<void, ErrorCode>> results;
     auto entries =
-        BuildStoreEntries(tenant_id, keys, batched_slices, indices, results);
+        BuildStoreEntries(keys, batched_slices, tenant_id, indices, results);
     if (entries.empty()) {
         return SaveTask([results = std::move(results)]() mutable {
             return std::move(results);
@@ -529,11 +557,15 @@ KvClientBackend::BatchPutRangesAsync(
     const std::vector<std::vector<size_t>>& destination_offsets,
     const TenantId& tenant_id) {
     if (keys.size() != sources.size() ||
-        keys.size() != destination_offsets.size())
+        keys.size() != destination_offsets.size()) {
+        LOG(WARNING) << "Invalid KVClient batch range store arguments, keys="
+                     << keys.size() << ", sources=" << sources.size()
+                     << ", offsets=" << destination_offsets.size();
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
     std::vector<size_t> indices;
     std::vector<tl::expected<void, ErrorCode>> results;
-    auto entries = BuildStoreEntries(tenant_id, keys, sources, indices, results,
+    auto entries = BuildStoreEntries(keys, sources, tenant_id, indices, results,
                                      &destination_offsets);
     if (entries.empty()) {
         return SaveTask([results = std::move(results)]() mutable {
@@ -570,6 +602,9 @@ KvClientBackend::BatchRemoveAsync(const std::vector<ObjectKey>& keys,
     for (size_t i = 0; i < keys.size(); ++i) {
         auto key = ResolveKey(keys[i], tenant_id);
         if (!key) {
+            LOG(WARNING) << "Invalid KVClient delete key, index=" << i
+                         << ", key=" << keys[i]
+                         << ", error=" << static_cast<int>(key.error());
             results[i] = tl::unexpected(key.error());
             continue;
         }

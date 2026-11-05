@@ -57,9 +57,9 @@ class KvClientBackend final : public ExternalStoreBackend {
         uint64_t base_offset, std::vector<kv::KVBuffer>& entries,
         const std::vector<size_t>* destination_offsets = nullptr);
     std::vector<kv::KVBuffer> BuildStoreEntries(
-        const TenantId& tenant_id, const std::vector<ObjectKey>& keys,
+        const std::vector<ObjectKey>& keys,
         const std::vector<std::vector<Slice>>& batched_slices,
-        std::vector<size_t>& indices,
+        const TenantId& tenant_id, std::vector<size_t>& indices,
         std::vector<tl::expected<void, ErrorCode>>& results,
         const std::vector<std::vector<size_t>>* destination_offsets = nullptr);
     std::vector<tl::expected<void, ErrorCode>> WaitForKeyResults(
