@@ -1,12 +1,14 @@
 #include "storage/external/kvclient_backend.h"
 
 #include <algorithm>
+#include <cstring>
 #include <functional>
 #include <glog/logging.h>
 #include <iterator>
 #include <limits>
 #include <mutex>
 #include <utility>
+#include <xxhash.h>
 
 #include "device/accelerator_registry.h"
 
@@ -47,15 +49,16 @@ ErrorCode ToError(const kv::Status& status) {
 
 }  // namespace
 
-tl::expected<kv::ResolvedKey, ErrorCode> KvClientBackend::ResolveKey(
-    const ObjectKey& key, const TenantId& tenant_id) const {
-    kv::ResolvedKey resolved;
-    const auto status =
-        kv_client_->ResolveKey(key, tenant_id.value(), resolved);
-    if (status.code == kv::StatusCode::INVALID_ARGUMENT)
-        return tl::unexpected(ErrorCode::INVALID_KEY);
-    if (!status.ok()) return tl::unexpected(ToError(status));
-    return resolved;
+tl::expected<kv::CacheKey, ErrorCode> KvClientBackend::EncodeKey(
+    const ObjectKey& key, const TenantId& tenant_id) {
+    const auto scoped_key = tenant_id.MakeScopedKey(key);
+    const uint64_t hash = XXH64(scoped_key.data(), scoped_key.size(), 0);
+    XXH64_canonical_t canonical;
+    XXH64_canonicalFromHash(&canonical, hash);
+    kv::CacheKey encoded;
+    static_assert(kv::kCacheKeySizeBytes == sizeof(canonical.digest));
+    std::memcpy(encoded.data(), canonical.digest, encoded.size());
+    return encoded;
 }
 
 KvClientBackend::~KvClientBackend() { (void)Shutdown(); }
@@ -197,7 +200,7 @@ KvClientBackend::BatchExistsAsync(const std::vector<ObjectKey>& keys,
     encoded_keys.reserve(keys.size());
     indices.reserve(keys.size());
     for (size_t i = 0; i < keys.size(); ++i) {
-        auto key = ResolveKey(keys[i], tenant_id);
+        auto key = EncodeKey(keys[i], tenant_id);
         if (!key) {
             LOG(WARNING) << "Invalid KVClient query key, index=" << i
                          << ", key=" << keys[i]
@@ -205,7 +208,7 @@ KvClientBackend::BatchExistsAsync(const std::vector<ObjectKey>& keys,
             results[i] = tl::unexpected(key.error());
             continue;
         }
-        encoded_keys.push_back(key->key);
+        encoded_keys.push_back(*key);
         indices.push_back(i);
     }
     kv::TaskId task = kv::kInvalidTaskId;
@@ -280,7 +283,7 @@ KvClientBackend::SubmitLoads(
     // Keep registrations stable until the SDK accepts the descriptors.
     std::shared_lock lock(memory_mutex_);
     for (size_t i = 0; i < keys.size(); ++i) {
-        auto key = ResolveKey(keys[i], tenant_id);
+        auto key = EncodeKey(keys[i], tenant_id);
         if (!key) {
             LOG(WARNING) << "Invalid KVClient load key, index=" << i
                          << ", key=" << keys[i]
@@ -288,7 +291,6 @@ KvClientBackend::SubmitLoads(
             results[i] = tl::unexpected(key.error());
             continue;
         }
-        const auto base_offset = key->base_offset;
         std::vector<kv::KVBuffer> object_entries;
         if (targets[i].empty()) {
             LOG(WARNING) << "Missing KVClient load targets for key=" << keys[i];
@@ -299,9 +301,7 @@ KvClientBackend::SubmitLoads(
             const auto& slice = targets[i][j];
             // Range offsets are relative to the object.
             const auto source_offset = source_offsets[i][j];
-            if (source_offset > std::numeric_limits<uint32_t>::max() ||
-                base_offset >
-                    std::numeric_limits<uint32_t>::max() - source_offset) {
+            if (source_offset > std::numeric_limits<uint32_t>::max()) {
                 LOG(WARNING)
                     << "KVClient load exceeds SDK offset limits for key="
                     << keys[i] << ", slice=" << j
@@ -310,7 +310,7 @@ KvClientBackend::SubmitLoads(
                 results[i] = tl::unexpected(ErrorCode::NOT_SUPPORTED);
                 break;
             }
-            const auto object_offset = base_offset + source_offset;
+            const auto object_offset = source_offset;
             const auto addr = reinterpret_cast<uintptr_t>(slice.ptr);
             auto registered = FindRegisteredMemory(slice);
             if (!registered) {
@@ -331,7 +331,7 @@ KvClientBackend::SubmitLoads(
                 break;
             }
             kv::KVBuffer entry{};
-            entry.key = key->key;
+            entry.key = *key;
             entry.buffer.region = (*registered)->region;
             entry.buffer.handle = (*registered)->handle;
             entry.buffer.region.addr = addr;
@@ -400,7 +400,7 @@ KvClientBackend::FindRegisteredMemory(const Slice& slice) const {
 
 tl::expected<void, ErrorCode> KvClientBackend::AppendStoreEntries(
     const kv::CacheKey& key, const std::vector<Slice>& slices,
-    uint64_t base_offset, std::vector<kv::KVBuffer>& entries,
+    std::vector<kv::KVBuffer>& entries,
     const std::vector<size_t>* destination_offsets) {
     if (slices.empty()) {
         LOG(WARNING) << "Missing KVClient store sources";
@@ -434,16 +434,13 @@ tl::expected<void, ErrorCode> KvClientBackend::AppendStoreEntries(
         const auto addr = reinterpret_cast<uintptr_t>(slice.ptr);
         uint64_t consumed = 0;
         while (consumed < slice.size) {
-            if (logical_offset > std::numeric_limits<uint32_t>::max() ||
-                base_offset >
-                    std::numeric_limits<uint32_t>::max() - logical_offset) {
+            if (logical_offset > std::numeric_limits<uint32_t>::max()) {
                 LOG(WARNING)
                     << "KVClient store exceeds SDK offset limits, slice=" << i
-                    << ", base_offset=" << base_offset
                     << ", logical_offset=" << logical_offset;
                 return tl::unexpected(ErrorCode::NOT_SUPPORTED);
             }
-            const uint64_t object_offset = base_offset + logical_offset;
+            const uint64_t object_offset = logical_offset;
             // Split descriptors, never pad or copy source payload.
             const uint64_t length =
                 std::min(slice.size - consumed, uint64_t{0x00fffe00});
@@ -471,7 +468,7 @@ std::vector<kv::KVBuffer> KvClientBackend::BuildStoreEntries(
     std::vector<kv::KVBuffer> entries;
     results.resize(keys.size());
     for (size_t i = 0; i < keys.size(); ++i) {
-        auto key = ResolveKey(keys[i], tenant_id);
+        auto key = EncodeKey(keys[i], tenant_id);
         if (!key) {
             LOG(WARNING) << "Invalid KVClient store key, index=" << i
                          << ", key=" << keys[i]
@@ -479,10 +476,9 @@ std::vector<kv::KVBuffer> KvClientBackend::BuildStoreEntries(
             results[i] = tl::unexpected(key.error());
             continue;
         }
-        const auto base_offset = key->base_offset;
         const auto begin = entries.size();
         results[i] = AppendStoreEntries(
-            key->key, batched_slices[i], base_offset, entries,
+            *key, batched_slices[i], entries,
             destination_offsets ? &(*destination_offsets)[i] : nullptr);
         if (!results[i]) {
             LOG(WARNING) << "Invalid KVClient store sources, index=" << i
@@ -600,7 +596,7 @@ KvClientBackend::BatchRemoveAsync(const std::vector<ObjectKey>& keys,
     sdk_keys.reserve(keys.size());
     indices.reserve(keys.size());
     for (size_t i = 0; i < keys.size(); ++i) {
-        auto key = ResolveKey(keys[i], tenant_id);
+        auto key = EncodeKey(keys[i], tenant_id);
         if (!key) {
             LOG(WARNING) << "Invalid KVClient delete key, index=" << i
                          << ", key=" << keys[i]
@@ -608,7 +604,7 @@ KvClientBackend::BatchRemoveAsync(const std::vector<ObjectKey>& keys,
             results[i] = tl::unexpected(key.error());
             continue;
         }
-        sdk_keys.push_back(key->key);
+        sdk_keys.push_back(*key);
         indices.push_back(i);
     }
     if (sdk_keys.empty()) {

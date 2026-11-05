@@ -58,7 +58,7 @@ class KvClientBackend final : public ExternalStoreBackend {
     // Append one key's slices in input order, splitting descriptors as needed.
     tl::expected<void, ErrorCode> AppendStoreEntries(
         const kv::CacheKey& key, const std::vector<Slice>& slices,
-        uint64_t base_offset, std::vector<kv::KVBuffer>& entries,
+        std::vector<kv::KVBuffer>& entries,
         const std::vector<size_t>* destination_offsets = nullptr);
 
     // Build descriptors and map each entry back to its input key index.
@@ -74,9 +74,9 @@ class KvClientBackend final : public ExternalStoreBackend {
         kv::TaskId task, const std::vector<size_t>& indices,
         std::vector<tl::expected<void, ErrorCode>> results);
 
-    // Delegate object identity and base offset mapping to the SDK.
-    tl::expected<kv::ResolvedKey, ErrorCode> ResolveKey(
-        const ObjectKey& key, const TenantId& tenant_id) const;
+    // Encode the tenant-scoped key for the KVClient wire protocol.
+    tl::expected<kv::CacheKey, ErrorCode> EncodeKey(const ObjectKey& key,
+                                                    const TenantId& tenant_id);
 
     kv::TaskResult WaitForCompletion(kv::TaskId task);
     tl::expected<TaskHandle, ErrorCode> SubmitLoads(
