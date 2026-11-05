@@ -110,6 +110,24 @@ class Client {
         return ReadReplicaSelector(this);
     }
 
+    tl::expected<ExternalStoreTaskGuard, ErrorCode> BatchPutExternalAsync(
+        const std::vector<ObjectKey>& keys,
+        const std::vector<std::vector<Slice>>& sources);
+    tl::expected<ExternalStoreTaskGuard, ErrorCode> BatchPutExternalRangesAsync(
+        const std::vector<ObjectKey>& keys,
+        const std::vector<std::vector<Slice>>& sources,
+        const std::vector<std::vector<size_t>>& destination_offsets);
+    tl::expected<ExternalStoreTaskGuard, ErrorCode> BatchRemoveExternalAsync(
+        const std::vector<ObjectKey>& keys);
+    void CompleteExternalRemove(
+        tl::expected<ExternalStoreTaskGuard, ErrorCode>& submission);
+    tl::expected<void, ErrorCode> CompleteExternalPut(
+        tl::expected<ExternalStoreTaskGuard, ErrorCode>& submission,
+        tl::expected<void, ErrorCode> native_result = {});
+    void CompleteExternalPut(
+        tl::expected<ExternalStoreTaskGuard, ErrorCode>& submission,
+        std::span<tl::expected<void, ErrorCode>> native_results);
+
     using WriteBufferStager =
         std::function<tl::expected<std::vector<Slice>, ErrorCode>(
             const std::vector<Slice>&)>;
@@ -1062,20 +1080,6 @@ class Client {
     tl::expected<void, ErrorCode> InitExternalStoreBackendFromEnvironment();
     tl::expected<ExternalStoreTaskGuard, ErrorCode> BatchExistsExternalAsync(
         const std::vector<ObjectKey>& keys, std::vector<uint8_t>* exists);
-    friend class RealClient;
-    void FinishExternalRemove(
-        const tl::expected<ExternalStoreBackend::TaskHandle, ErrorCode>&
-            submission);
-    tl::expected<void, ErrorCode> FinishExternalPut(
-        const tl::expected<ExternalStoreBackend::TaskHandle, ErrorCode>&
-            submission,
-        tl::expected<void, ErrorCode> native_result = {});
-    void FinishExternalPut(
-        const tl::expected<ExternalStoreBackend::TaskHandle, ErrorCode>&
-            submission,
-        std::span<tl::expected<void, ErrorCode>> native_results);
-    std::vector<tl::expected<void, ErrorCode>> WaitExternal(
-        ExternalStoreBackend::TaskHandle task);
     /**
      * @brief Internal helper functions for initialization and data transfer
      */

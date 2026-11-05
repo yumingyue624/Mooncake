@@ -507,9 +507,15 @@ KvClientBackend::BatchPutAsync(
             return std::move(results);
         });
     }
-    kv::TaskId task;
+    kv::TaskId task = kv::kInvalidTaskId;
     auto submitted = kv_client_->BatchStoreAsync(entries, task);
-    if (!submitted.ok()) return tl::unexpected(ToError(submitted));
+    if (!submitted.ok()) {
+        LOG(WARNING) << "Failed to submit KVClient store, entries="
+                     << entries.size()
+                     << ", status=" << static_cast<int>(submitted.code)
+                     << ", error=" << submitted.message;
+        return tl::unexpected(ToError(submitted));
+    }
     return SaveTask([this, task, indices = std::move(indices),
                      results = std::move(results)]() mutable {
         return WaitForKeyResults(task, indices, std::move(results));
@@ -517,7 +523,7 @@ KvClientBackend::BatchPutAsync(
 }
 
 tl::expected<ExternalStoreBackend::TaskHandle, ErrorCode>
-KvClientBackend::PutRangesAsync(
+KvClientBackend::BatchPutRangesAsync(
     const std::vector<ObjectKey>& keys,
     const std::vector<std::vector<Slice>>& sources,
     const std::vector<std::vector<size_t>>& destination_offsets,
@@ -534,9 +540,15 @@ KvClientBackend::PutRangesAsync(
             return std::move(results);
         });
     }
-    kv::TaskId task;
+    kv::TaskId task = kv::kInvalidTaskId;
     auto submitted = kv_client_->BatchStoreAsync(entries, task);
-    if (!submitted.ok()) return tl::unexpected(ToError(submitted));
+    if (!submitted.ok()) {
+        LOG(WARNING) << "Failed to submit KVClient store, entries="
+                     << entries.size()
+                     << ", status=" << static_cast<int>(submitted.code)
+                     << ", error=" << submitted.message;
+        return tl::unexpected(ToError(submitted));
+    }
     return SaveTask([this, task, indices = std::move(indices),
                      results = std::move(results)]() mutable {
         return WaitForKeyResults(task, indices, std::move(results));
@@ -569,9 +581,15 @@ KvClientBackend::BatchRemoveAsync(const std::vector<ObjectKey>& keys,
             return std::move(results);
         });
     }
-    kv::TaskId task;
+    kv::TaskId task = kv::kInvalidTaskId;
     auto submitted = kv_client_->DeleteAsync(sdk_keys, task);
-    if (!submitted.ok()) return tl::unexpected(ToError(submitted));
+    if (!submitted.ok()) {
+        LOG(WARNING) << "Failed to submit KVClient delete, keys="
+                     << sdk_keys.size()
+                     << ", status=" << static_cast<int>(submitted.code)
+                     << ", error=" << submitted.message;
+        return tl::unexpected(ToError(submitted));
+    }
     return SaveTask([this, task, indices = std::move(indices),
                      results = std::move(results)]() mutable {
         return WaitForKeyResults(task, indices, std::move(results));

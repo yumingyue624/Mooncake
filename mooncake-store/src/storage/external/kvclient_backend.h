@@ -24,7 +24,7 @@ class KvClientBackend final : public ExternalStoreBackend {
         const std::vector<ObjectKey>& keys,
         const std::vector<std::vector<Slice>>& batched_slices,
         const TenantId& tenant_id) override;
-    tl::expected<TaskHandle, ErrorCode> PutRangesAsync(
+    tl::expected<TaskHandle, ErrorCode> BatchPutRangesAsync(
         const std::vector<ObjectKey>& keys,
         const std::vector<std::vector<Slice>>& sources,
         const std::vector<std::vector<size_t>>& destination_offsets,

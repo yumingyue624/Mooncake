@@ -47,7 +47,7 @@ class ExternalStoreBackend {
         const std::vector<std::vector<Slice>>& batched_slices,
         const TenantId& tenant_id) = 0;
     // Write each source slice at its corresponding key-relative byte offset.
-    virtual tl::expected<TaskHandle, ErrorCode> PutRangesAsync(
+    virtual tl::expected<TaskHandle, ErrorCode> BatchPutRangesAsync(
         const std::vector<ObjectKey>& keys,
         const std::vector<std::vector<Slice>>& sources,
         const std::vector<std::vector<size_t>>& destination_offsets,

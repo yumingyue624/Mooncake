@@ -8273,37 +8273,31 @@ std::vector<int> RealClient::batch_put_from_multi_buffer_ranges(
         }
     } inflight_guard{this, std::move(inflight_keys)};
 
-    tl::expected<ExternalStoreBackend::TaskHandle, ErrorCode> external{nullptr};
-    if (client_->external_store_backend_) {
-        std::vector<ObjectKey> external_keys;
-        std::vector<std::vector<size_t>> external_offsets;
-        external_keys.reserve(idx_map.size());
-        external_offsets.reserve(idx_map.size());
-        for (const auto i : idx_map) {
-            external_keys.push_back(keys[i]);
-            external_offsets.push_back(all_dst_offsets[i]);
-        }
-        external = client_->external_store_backend_->PutRangesAsync(
-            external_keys, slices, external_offsets,
-            TenantId(client_->master_client_.tenant_id()));
+    std::vector<ObjectKey> external_keys;
+    std::vector<std::vector<size_t>> external_offsets;
+    external_keys.reserve(idx_map.size());
+    external_offsets.reserve(idx_map.size());
+    for (const auto i : idx_map) {
+        external_keys.push_back(keys[i]);
+        external_offsets.push_back(all_dst_offsets[i]);
     }
+    auto external = client_->BatchPutExternalRangesAsync(external_keys, slices,
+                                                         external_offsets);
 
     auto transfer = client_->BatchTransferWriteRanges(replicas_per_entry,
                                                       slices, dst_offsets);
-    if (client_->external_store_backend_) {
-        std::vector<tl::expected<void, ErrorCode>> statuses(transfer.size());
-        for (size_t i = 0; i < transfer.size(); ++i) {
-            if (!transfer[i]) statuses[i] = tl::unexpected(transfer[i].error());
-        }
-        client_->FinishExternalPut(external, std::span(statuses));
-        for (size_t i = 0; i < transfer.size(); ++i) {
-            if (!transfer[i] && statuses[i]) {
-                // Count logical bytes once when only the external write
-                // succeeds.
-                int64_t bytes = 0;
-                for (const auto &slice : slices[i]) bytes += slice.size;
-                transfer[i] = bytes;
-            }
+    std::vector<tl::expected<void, ErrorCode>> statuses(transfer.size());
+    for (size_t i = 0; i < transfer.size(); ++i) {
+        if (!transfer[i]) statuses[i] = tl::unexpected(transfer[i].error());
+    }
+    client_->CompleteExternalPut(external, std::span(statuses));
+    for (size_t i = 0; i < transfer.size(); ++i) {
+        if (!transfer[i] && statuses[i]) {
+            // Count logical bytes once when only the external write
+            // succeeds.
+            int64_t bytes = 0;
+            for (const auto &slice : slices[i]) bytes += slice.size;
+            transfer[i] = bytes;
         }
     }
     for (size_t k = 0; k < transfer.size(); ++k) {
