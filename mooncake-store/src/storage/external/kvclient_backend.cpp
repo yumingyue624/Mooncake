@@ -431,16 +431,6 @@ tl::expected<void, ErrorCode> KvClientBackend::AppendStoreEntries(
             // Keep a snapshot; the map entry may be erased after unlocking.
             registered = **region;
         }
-        if (slice.size > 0xFFFFFF) {
-            LOG(WARNING) << "KVClient store exceeds SDK length limits, slice="
-                         << i << ", size=" << slice.size;
-            return tl::unexpected(ErrorCode::INVALID_PARAMS);
-        }
-        if (logical_offset > std::numeric_limits<uint32_t>::max()) {
-            LOG(WARNING) << "KVClient store exceeds SDK offset limits, slice="
-                         << i << ", logical_offset=" << logical_offset;
-            return tl::unexpected(ErrorCode::NOT_SUPPORTED);
-        }
         kv::KVBuffer entry{};
         entry.key = key;
         entry.buffer.region = registered.region;

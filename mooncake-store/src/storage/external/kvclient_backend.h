@@ -55,7 +55,7 @@ class KvClientBackend final : public ExternalStoreBackend {
     tl::expected<const kv::RegisteredMemory*, ErrorCode> FindRegisteredMemory(
         const Slice& slice) const;
 
-    // Append one descriptor per slice in input order, within SDK length limits.
+    // Append one descriptor per slice in input order.
     tl::expected<void, ErrorCode> AppendStoreEntries(
         const kv::CacheKey& key, const std::vector<Slice>& slices,
         std::vector<kv::KVBuffer>& entries,
