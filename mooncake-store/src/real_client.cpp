@@ -7205,6 +7205,10 @@ std::vector<int> RealClient::batch_put_from_multi_buffer_ranges(
     std::vector<std::vector<uint64_t>> dst_offsets;
     std::vector<size_t> idx_map;
     std::vector<std::string> inflight_keys;
+    std::vector<ObjectKey> external_keys;
+    std::vector<std::vector<size_t>> external_offsets;
+    external_keys.reserve(keys.size());
+    external_offsets.reserve(keys.size());
 
     {
         std::lock_guard<std::mutex> lock(session_mutex_);
@@ -7244,6 +7248,8 @@ std::vector<int> RealClient::batch_put_from_multi_buffer_ranges(
             slices.push_back(std::move(entry_slices));
             dst_offsets.push_back(std::move(entry_offsets));
             idx_map.push_back(i);
+            external_keys.push_back(keys[i]);
+            external_offsets.push_back(offsets);
         }
     }
 
@@ -7272,8 +7278,12 @@ std::vector<int> RealClient::batch_put_from_multi_buffer_ranges(
         }
     } inflight_guard{this, std::move(inflight_keys)};
 
+    auto external = client_->BatchPutExternalRangesAsync(external_keys, slices,
+                                                         external_offsets);
+
     auto transfer = client_->BatchTransferWriteRanges(replicas_per_entry,
                                                       slices, dst_offsets);
+    client_->CompleteExternalRangePut(external, slices, transfer);
     for (size_t k = 0; k < transfer.size(); ++k) {
         results[idx_map[k]] = std::move(transfer[k]);
     }
