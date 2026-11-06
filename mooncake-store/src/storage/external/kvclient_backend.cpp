@@ -431,30 +431,25 @@ tl::expected<void, ErrorCode> KvClientBackend::AppendStoreEntries(
             // Keep a snapshot; the map entry may be erased after unlocking.
             registered = **region;
         }
-        const auto addr = reinterpret_cast<uintptr_t>(slice.ptr);
-        uint64_t consumed = 0;
-        while (consumed < slice.size) {
-            if (logical_offset > std::numeric_limits<uint32_t>::max()) {
-                LOG(WARNING)
-                    << "KVClient store exceeds SDK offset limits, slice=" << i
-                    << ", logical_offset=" << logical_offset;
-                return tl::unexpected(ErrorCode::NOT_SUPPORTED);
-            }
-            const uint64_t object_offset = logical_offset;
-            // Split descriptors, never pad or copy source payload.
-            const uint64_t length =
-                std::min(slice.size - consumed, uint64_t{0x00fffe00});
-            kv::KVBuffer entry{};
-            entry.key = key;
-            entry.buffer.region = registered.region;
-            entry.buffer.region.addr = addr + consumed;
-            entry.buffer.region.size = length;
-            entry.buffer.handle = registered.handle;
-            entry.offset = static_cast<uint32_t>(object_offset);
-            entries.push_back(entry);
-            consumed += length;
-            logical_offset += length;
+        if (slice.size > 0xFFFFFF) {
+            LOG(WARNING) << "KVClient store exceeds SDK length limits, slice="
+                         << i << ", size=" << slice.size;
+            return tl::unexpected(ErrorCode::INVALID_PARAMS);
         }
+        if (logical_offset > std::numeric_limits<uint32_t>::max()) {
+            LOG(WARNING) << "KVClient store exceeds SDK offset limits, slice="
+                         << i << ", logical_offset=" << logical_offset;
+            return tl::unexpected(ErrorCode::NOT_SUPPORTED);
+        }
+        kv::KVBuffer entry{};
+        entry.key = key;
+        entry.buffer.region = registered.region;
+        entry.buffer.region.addr = reinterpret_cast<uintptr_t>(slice.ptr);
+        entry.buffer.region.size = slice.size;
+        entry.buffer.handle = registered.handle;
+        entry.offset = static_cast<uint32_t>(logical_offset);
+        entries.push_back(entry);
+        logical_offset += slice.size;
     }
     return {};
 }
