@@ -3699,10 +3699,6 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPut(
         return std::vector<tl::expected<void, ErrorCode>>(
             keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
     }
-    if (keys.size() != batched_slices.size()) {
-        return std::vector<tl::expected<void, ErrorCode>>(
-            keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
-    }
     auto external = BatchPutExternalAsync(keys, batched_slices);
     ReplicateConfig client_cfg = AttachHostId(config);
     if (protocol_ == "cxl") {
