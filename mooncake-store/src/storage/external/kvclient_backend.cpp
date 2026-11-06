@@ -7,8 +7,8 @@
 #include <iterator>
 #include <limits>
 #include <mutex>
-#include <utility>
 #include <xxhash.h>
+#include <utility>
 
 #include "device/accelerator_registry.h"
 
