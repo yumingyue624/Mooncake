@@ -388,6 +388,14 @@ tl::expected<void, ErrorCode> KvClientBackend::AppendStoreEntries(
     for (size_t i = 0; i < slices.size(); ++i) {
         const auto& slice = slices[i];
         if (destination_offsets) logical_offset = (*destination_offsets)[i];
+        // Check before converting offsets and lengths to SDK descriptors.
+        if (logical_offset > std::numeric_limits<uint32_t>::max() ||
+            slice.size > std::numeric_limits<uint32_t>::max()) {
+            LOG(WARNING) << "KVClient store exceeds SDK offset or length limits"
+                         << ", slice=" << i << ", offset=" << logical_offset
+                         << ", size=" << slice.size;
+            return tl::unexpected(ErrorCode::NOT_SUPPORTED);
+        }
         kv::RegisteredMemory registered;
         {
             std::shared_lock lock(memory_mutex_);
