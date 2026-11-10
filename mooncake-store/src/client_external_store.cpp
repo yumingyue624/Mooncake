@@ -141,7 +141,7 @@ tl::expected<ExternalStoreTaskGuard, ErrorCode> Client::BatchPutExternalAsync(
     auto submitted = external_store_backend_->BatchPutAsync(
         keys, sources, TenantId(master_client_.tenant_id()));
     if (!submitted) return tl::unexpected(submitted.error());
-    return ExternalStoreTaskGuard(external_store_backend_, *submitted);
+    return ExternalStoreTaskGuard(external_store_backend_.get(), *submitted);
 }
 
 tl::expected<ExternalStoreTaskGuard, ErrorCode>
@@ -155,7 +155,7 @@ Client::BatchPutExternalRangesAsync(
         keys, sources, destination_offsets,
         TenantId(master_client_.tenant_id()));
     if (!submitted) return tl::unexpected(submitted.error());
-    return ExternalStoreTaskGuard(external_store_backend_, *submitted);
+    return ExternalStoreTaskGuard(external_store_backend_.get(), *submitted);
 }
 
 tl::expected<ExternalStoreTaskGuard, ErrorCode>
@@ -165,7 +165,7 @@ Client::BatchRemoveExternalAsync(const std::vector<ObjectKey>& keys) {
     auto submitted = external_store_backend_->BatchRemoveAsync(
         keys, TenantId(master_client_.tenant_id()));
     if (!submitted) return tl::unexpected(submitted.error());
-    return ExternalStoreTaskGuard(external_store_backend_, *submitted);
+    return ExternalStoreTaskGuard(external_store_backend_.get(), *submitted);
 }
 
 tl::expected<void, ErrorCode> Client::CompleteExternalPut(

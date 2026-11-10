@@ -65,7 +65,7 @@ class KvClientBackend final : public ExternalStoreBackend {
     std::vector<kv::KVBuffer> BuildStoreEntries(
         const std::vector<ObjectKey>& keys,
         const std::vector<std::vector<Slice>>& batched_slices,
-        const TenantId& tenant_id, std::vector<size_t>& indices,
+        std::vector<size_t>& indices,
         std::vector<tl::expected<void, ErrorCode>>& results,
         const std::vector<std::vector<size_t>>* destination_offsets = nullptr);
 
@@ -73,10 +73,6 @@ class KvClientBackend final : public ExternalStoreBackend {
     std::vector<tl::expected<void, ErrorCode>> WaitForKeyResults(
         kv::TaskId task, const std::vector<size_t>& indices,
         std::vector<tl::expected<void, ErrorCode>> results);
-
-    // Encode the tenant-scoped key for the KVClient wire protocol.
-    tl::expected<kv::CacheKey, ErrorCode> EncodeKey(const ObjectKey& key,
-                                                    const TenantId& tenant_id);
 
     kv::TaskResult WaitForCompletion(kv::TaskId task);
     tl::expected<TaskHandle, ErrorCode> SubmitLoads(

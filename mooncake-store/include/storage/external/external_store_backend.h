@@ -59,7 +59,6 @@ class ExternalStoreBackend {
     virtual tl::expected<TaskHandle, ErrorCode> BatchRemoveAsync(
         const std::vector<ObjectKey>& keys, const TenantId& tenant_id) = 0;
 
-
     /**
      * @brief Submits object existence queries.
      * @param keys Object keys to query.

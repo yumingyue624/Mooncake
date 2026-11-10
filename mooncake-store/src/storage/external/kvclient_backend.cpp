@@ -1,13 +1,11 @@
 #include "storage/external/kvclient_backend.h"
 
 #include <algorithm>
-#include <cstring>
 #include <functional>
 #include <glog/logging.h>
 #include <iterator>
 #include <limits>
 #include <mutex>
-#include <xxhash.h>
 #include <utility>
 
 #include "device/accelerator_registry.h"
@@ -48,18 +46,6 @@ ErrorCode ToError(const kv::Status& status) {
 }
 
 }  // namespace
-
-tl::expected<kv::CacheKey, ErrorCode> KvClientBackend::EncodeKey(
-    const ObjectKey& key, const TenantId& tenant_id) {
-    const auto scoped_key = tenant_id.MakeScopedKey(key);
-    const uint64_t hash = XXH64(scoped_key.data(), scoped_key.size(), 0);
-    XXH64_canonical_t canonical;
-    XXH64_canonicalFromHash(&canonical, hash);
-    kv::CacheKey encoded;
-    static_assert(kv::kCacheKeySizeBytes == sizeof(canonical.digest));
-    std::memcpy(encoded.data(), canonical.digest, encoded.size());
-    return encoded;
-}
 
 KvClientBackend::~KvClientBackend() { (void)Shutdown(); }
 
@@ -194,29 +180,22 @@ tl::expected<ExternalStoreBackend::TaskHandle, ErrorCode>
 KvClientBackend::BatchExistsAsync(const std::vector<ObjectKey>& keys,
                                   const TenantId& tenant_id,
                                   std::vector<uint8_t>* exists) {
-    std::vector<kv::CacheKey> encoded_keys;
+    std::vector<kv::CacheKey> sdk_keys;
     std::vector<size_t> indices;
     std::vector<tl::expected<void, ErrorCode>> results(keys.size());
-    encoded_keys.reserve(keys.size());
+    sdk_keys.reserve(keys.size());
     indices.reserve(keys.size());
     for (size_t i = 0; i < keys.size(); ++i) {
-        auto key = EncodeKey(keys[i], tenant_id);
-        if (!key) {
-            LOG(WARNING) << "Invalid KVClient query key, index=" << i
-                         << ", key=" << keys[i]
-                         << ", error=" << static_cast<int>(key.error());
-            results[i] = tl::unexpected(key.error());
-            continue;
-        }
-        encoded_keys.push_back(*key);
+        sdk_keys.emplace_back(keys[i]);
         indices.push_back(i);
     }
     kv::TaskId task = kv::kInvalidTaskId;
-    if (!encoded_keys.empty()) {
-        auto submitted = kv_client_->QueryAsync(encoded_keys, task);
+    if (!sdk_keys.empty()) {
+        auto submitted =
+            kv_client_->QueryAsync(sdk_keys, task, tenant_id.value());
         if (!submitted.ok()) {
             LOG(WARNING) << "Failed to submit KVClient query, keys="
-                         << encoded_keys.size()
+                         << sdk_keys.size()
                          << ", status=" << static_cast<int>(submitted.code)
                          << ", error=" << submitted.message;
             return tl::unexpected(ToError(submitted));
@@ -283,14 +262,6 @@ KvClientBackend::SubmitLoads(
     // Keep registrations stable until the SDK accepts the descriptors.
     std::shared_lock lock(memory_mutex_);
     for (size_t i = 0; i < keys.size(); ++i) {
-        auto key = EncodeKey(keys[i], tenant_id);
-        if (!key) {
-            LOG(WARNING) << "Invalid KVClient load key, index=" << i
-                         << ", key=" << keys[i]
-                         << ", error=" << static_cast<int>(key.error());
-            results[i] = tl::unexpected(key.error());
-            continue;
-        }
         std::vector<kv::KVBuffer> object_entries;
         if (targets[i].empty()) {
             LOG(WARNING) << "Missing KVClient load targets for key=" << keys[i];
@@ -331,7 +302,7 @@ KvClientBackend::SubmitLoads(
                 break;
             }
             kv::KVBuffer entry{};
-            entry.key = *key;
+            entry.key = keys[i];
             entry.buffer.region = (*registered)->region;
             entry.buffer.handle = (*registered)->handle;
             entry.buffer.region.addr = addr;
@@ -351,7 +322,7 @@ KvClientBackend::SubmitLoads(
     kv::TaskId sdk_task = kv::kInvalidTaskId;
     auto submitted = kv::Status::OK();
     if (!entries.empty())
-        submitted = kv_client_->BatchLoadAsync(entries, sdk_task);
+        submitted = kv_client_->LoadAsync(entries, sdk_task, tenant_id.value());
     lock.unlock();
     if (!submitted.ok()) {
         LOG(WARNING) << "Failed to submit KVClient load, entries="
@@ -447,23 +418,15 @@ tl::expected<void, ErrorCode> KvClientBackend::AppendStoreEntries(
 std::vector<kv::KVBuffer> KvClientBackend::BuildStoreEntries(
     const std::vector<ObjectKey>& keys,
     const std::vector<std::vector<Slice>>& batched_slices,
-    const TenantId& tenant_id, std::vector<size_t>& indices,
+    std::vector<size_t>& indices,
     std::vector<tl::expected<void, ErrorCode>>& results,
     const std::vector<std::vector<size_t>>* destination_offsets) {
     std::vector<kv::KVBuffer> entries;
     results.resize(keys.size());
     for (size_t i = 0; i < keys.size(); ++i) {
-        auto key = EncodeKey(keys[i], tenant_id);
-        if (!key) {
-            LOG(WARNING) << "Invalid KVClient store key, index=" << i
-                         << ", key=" << keys[i]
-                         << ", error=" << static_cast<int>(key.error());
-            results[i] = tl::unexpected(key.error());
-            continue;
-        }
         const auto begin = entries.size();
         results[i] = AppendStoreEntries(
-            *key, batched_slices[i], entries,
+            keys[i], batched_slices[i], entries,
             destination_offsets ? &(*destination_offsets)[i] : nullptr);
         if (!results[i]) {
             LOG(WARNING) << "Invalid KVClient store sources, index=" << i
@@ -509,15 +472,14 @@ KvClientBackend::BatchPutAsync(
     }
     std::vector<size_t> indices;
     std::vector<tl::expected<void, ErrorCode>> results;
-    auto entries =
-        BuildStoreEntries(keys, batched_slices, tenant_id, indices, results);
+    auto entries = BuildStoreEntries(keys, batched_slices, indices, results);
     if (entries.empty()) {
         return SaveTask([results = std::move(results)]() mutable {
             return std::move(results);
         });
     }
     kv::TaskId task = kv::kInvalidTaskId;
-    auto submitted = kv_client_->StoreAsync(entries, task);
+    auto submitted = kv_client_->StoreAsync(entries, task, tenant_id.value());
     if (!submitted.ok()) {
         LOG(WARNING) << "Failed to submit KVClient store, entries="
                      << entries.size()
@@ -546,7 +508,7 @@ KvClientBackend::BatchPutRangesAsync(
     }
     std::vector<size_t> indices;
     std::vector<tl::expected<void, ErrorCode>> results;
-    auto entries = BuildStoreEntries(keys, sources, tenant_id, indices, results,
+    auto entries = BuildStoreEntries(keys, sources, indices, results,
                                      &destination_offsets);
     if (entries.empty()) {
         return SaveTask([results = std::move(results)]() mutable {
@@ -554,7 +516,7 @@ KvClientBackend::BatchPutRangesAsync(
         });
     }
     kv::TaskId task = kv::kInvalidTaskId;
-    auto submitted = kv_client_->StoreAsync(entries, task);
+    auto submitted = kv_client_->StoreAsync(entries, task, tenant_id.value());
     if (!submitted.ok()) {
         LOG(WARNING) << "Failed to submit KVClient store, entries="
                      << entries.size()
@@ -581,24 +543,11 @@ KvClientBackend::BatchRemoveAsync(const std::vector<ObjectKey>& keys,
     sdk_keys.reserve(keys.size());
     indices.reserve(keys.size());
     for (size_t i = 0; i < keys.size(); ++i) {
-        auto key = EncodeKey(keys[i], tenant_id);
-        if (!key) {
-            LOG(WARNING) << "Invalid KVClient delete key, index=" << i
-                         << ", key=" << keys[i]
-                         << ", error=" << static_cast<int>(key.error());
-            results[i] = tl::unexpected(key.error());
-            continue;
-        }
-        sdk_keys.push_back(*key);
+        sdk_keys.emplace_back(keys[i]);
         indices.push_back(i);
     }
-    if (sdk_keys.empty()) {
-        return SaveTask([results = std::move(results)]() mutable {
-            return std::move(results);
-        });
-    }
     kv::TaskId task = kv::kInvalidTaskId;
-    auto submitted = kv_client_->DeleteAsync(sdk_keys, task);
+    auto submitted = kv_client_->DeleteAsync(sdk_keys, task, tenant_id.value());
     if (!submitted.ok()) {
         LOG(WARNING) << "Failed to submit KVClient delete, keys="
                      << sdk_keys.size()
