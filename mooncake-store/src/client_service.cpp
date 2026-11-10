@@ -2082,14 +2082,12 @@ bool Client::RedirectToHotCache(const std::string& key,
 tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
                                           std::vector<Slice>& slices,
                                           const ReplicateConfig& config) {
-    auto external = BatchPutExternalAsync({key}, {slices});
     std::optional<uint64_t> object_checksum;
     if (object_checksum_enabled_) {
         auto checksum_result = ComputeObjectChecksumForSlices(
             key, slices, CalculateSliceSize(slices));
         if (!checksum_result) {
-            return CompleteExternalPut(external,
-                                       tl::unexpected(checksum_result.error()));
+            return tl::unexpected(checksum_result.error());
         }
         object_checksum = *checksum_result;
     }
@@ -2111,6 +2109,7 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
     }
 
     // Start put operation
+    auto external = BatchPutExternalAsync({key}, {slices});
     auto start_result = master_client_.PutStart(key, slice_lengths, client_cfg);
     if (!start_result &&
         start_result.error() == ErrorCode::OBJECT_ALREADY_EXISTS &&
@@ -3699,7 +3698,6 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPut(
         return std::vector<tl::expected<void, ErrorCode>>(
             keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
     }
-    auto external = BatchPutExternalAsync(keys, batched_slices);
     ReplicateConfig client_cfg = AttachHostId(config);
     if (protocol_ == "cxl") {
         client_cfg.preferred_segment = local_hostname_;
@@ -3708,12 +3706,11 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPut(
     ComputeBatchObjectChecksums(ops);
     if (client_cfg.prefer_alloc_in_same_node) {
         if (auto err = ValidatePreferSameNodeWriteConfig(client_cfg)) {
-            auto native_results = std::vector<tl::expected<void, ErrorCode>>(
+            return std::vector<tl::expected<void, ErrorCode>>(
                 keys.size(), tl::unexpected(*err));
-            CompleteExternalPut(external, std::span(native_results));
-            return native_results;
         }
     }
+    auto external = BatchPutExternalAsync(keys, batched_slices);
     StartBatchPut(ops, client_cfg);
     StageWriteBuffersForRemoteReplicas(ops, stager);
 
@@ -3841,10 +3838,10 @@ tl::expected<void, ErrorCode> Client::Remove(const ObjectKey& key, bool force) {
         return std::move(results.front());
     }
 
-    auto external = BatchRemoveExternalAsync({key});
     if (hot_cache_) {
         hot_cache_->BumpKeyGeneration(key);
     }
+    auto external = BatchRemoveExternalAsync({key});
     auto result = master_client_.Remove(key, force);
     CompleteExternalRemove(external);
     // if (storage_backend_) {
@@ -3901,11 +3898,11 @@ tl::expected<long, ErrorCode> Client::RemoveAll(bool force) {
 
 std::vector<tl::expected<void, ErrorCode>> Client::BatchRemove(
     const std::vector<ObjectKey>& keys, bool force) {
-    auto external = BatchRemoveExternalAsync(keys);
     if (hot_cache_) {
         hot_cache_->BumpKeyGenerations(keys);
     }
 
+    auto external = BatchRemoveExternalAsync(keys);
     auto results = master_client_.BatchRemove(keys, force);
     CompleteExternalRemove(external);
 
