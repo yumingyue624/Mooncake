@@ -20,6 +20,19 @@ class KvClientBackend final : public ExternalStoreBackend {
     tl::expected<void, ErrorCode> Init(
         const std::unordered_map<std::string, std::string>& options) override;
     tl::expected<void, ErrorCode> Shutdown() override;
+
+    tl::expected<TaskHandle, ErrorCode> BatchPutAsync(
+        const std::vector<ObjectKey>& keys,
+        const std::vector<std::vector<Slice>>& batched_slices,
+        const TenantId& tenant_id) override;
+    tl::expected<TaskHandle, ErrorCode> BatchPutRangesAsync(
+        const std::vector<ObjectKey>& keys,
+        const std::vector<std::vector<Slice>>& sources,
+        const std::vector<std::vector<size_t>>& destination_offsets,
+        const TenantId& tenant_id) override;
+    tl::expected<TaskHandle, ErrorCode> BatchRemoveAsync(
+        const std::vector<ObjectKey>& keys, const TenantId& tenant_id) override;
+
     tl::expected<TaskHandle, ErrorCode> BatchExistsAsync(
         const std::vector<ObjectKey>& keys, const TenantId& tenant_id,
         std::vector<uint8_t>* exists) override;
@@ -41,8 +54,26 @@ class KvClientBackend final : public ExternalStoreBackend {
    private:
     tl::expected<const kv::RegisteredMemory*, ErrorCode> FindRegisteredMemory(
         const Slice& slice) const;
-    tl::expected<kv::CacheKey, ErrorCode> EncodeKey(const ObjectKey& key,
-                                                    const TenantId& tenant_id);
+
+    // Append one descriptor per slice in input order.
+    tl::expected<void, ErrorCode> AppendStoreEntries(
+        const kv::CacheKey& key, const std::vector<Slice>& slices,
+        std::vector<kv::KVBuffer>& entries,
+        const std::vector<size_t>* destination_offsets = nullptr);
+
+    // Build descriptors and map each entry back to its input key index.
+    std::vector<kv::KVBuffer> BuildStoreEntries(
+        const std::vector<ObjectKey>& keys,
+        const std::vector<std::vector<Slice>>& batched_slices,
+        std::vector<size_t>& indices,
+        std::vector<tl::expected<void, ErrorCode>>& results,
+        const std::vector<std::vector<size_t>>* destination_offsets = nullptr);
+
+    // Reduce SDK entry results to one completion status per input key.
+    std::vector<tl::expected<void, ErrorCode>> WaitForKeyResults(
+        kv::TaskId task, const std::vector<size_t>& indices,
+        std::vector<tl::expected<void, ErrorCode>> results);
+
     kv::TaskResult WaitForCompletion(kv::TaskId task);
     tl::expected<TaskHandle, ErrorCode> SubmitLoads(
         const std::vector<ObjectKey>& keys,

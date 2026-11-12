@@ -110,6 +110,64 @@ class Client {
         return ReadReplicaSelector(this);
     }
 
+    /**
+     * @brief Submits batch writes to external storage
+     * @param keys Object keys
+     * @param sources Data slices indexed to match keys, in object byte order.
+     * Source buffers must remain valid and unchanged until the task completes.
+     * @return Task guard on submission success, or ErrorCode on failure.
+     * Returns an empty guard if keys is empty or no backend is configured.
+     */
+    tl::expected<ExternalStoreTaskGuard, ErrorCode> BatchPutExternalAsync(
+        const std::vector<ObjectKey>& keys,
+        const std::vector<std::vector<Slice>>& sources);
+
+    /**
+     * @brief Submits batch range writes to external storage
+     * @param keys Object keys
+     * @param sources Data slices indexed to match keys. Source buffers must
+     * remain valid and unchanged until the task completes.
+     * @param destination_offsets Byte offsets relative to each logical key,
+     * indexed to match sources
+     * @return Task guard on submission success, or ErrorCode on failure.
+     * Returns an empty guard if keys is empty or no backend is configured.
+     */
+    tl::expected<ExternalStoreTaskGuard, ErrorCode> BatchPutExternalRangesAsync(
+        const std::vector<ObjectKey>& keys,
+        const std::vector<std::vector<Slice>>& sources,
+        const std::vector<std::vector<size_t>>& destination_offsets);
+
+    /**
+     * @brief Submits external deletes independently of native replica leases
+     * @param keys Object keys to remove
+     * @return Task guard on submission success, or ErrorCode on failure.
+     * Returns an empty guard if keys is empty or no backend is configured.
+     */
+    tl::expected<ExternalStoreTaskGuard, ErrorCode> BatchRemoveExternalAsync(
+        const std::vector<ObjectKey>& keys);
+
+    /**
+     * @brief Helper methods for completing external storage operations
+     *
+     * Accepted tasks are waited and consumed; empty guards leave native
+     * results unchanged. Put succeeds per key if either storage path succeeds;
+     * otherwise the native error is preserved. Range writes retain native byte
+     * counts and errors so callers can decide whether to end or revoke a
+     * session. Remove logs external failures without changing native deletion
+     * results.
+     */
+    void CompleteExternalRemove(
+        tl::expected<ExternalStoreTaskGuard, ErrorCode>& submission);
+    tl::expected<void, ErrorCode> CompleteExternalPut(
+        tl::expected<ExternalStoreTaskGuard, ErrorCode>& submission,
+        tl::expected<void, ErrorCode> native_result = {});
+    void CompleteExternalPut(
+        tl::expected<ExternalStoreTaskGuard, ErrorCode>& submission,
+        std::span<tl::expected<void, ErrorCode>> native_results);
+    void CompleteExternalRangePut(
+        tl::expected<ExternalStoreTaskGuard, ErrorCode>& submission,
+        const std::vector<ObjectKey>& keys);
+
     using WriteBufferStager =
         std::function<tl::expected<std::vector<Slice>, ErrorCode>(
             const std::vector<Slice>&)>;

@@ -40,6 +40,25 @@ class ExternalStoreBackend {
      */
     virtual tl::expected<void, ErrorCode> Shutdown() = 0;
 
+    // batched_slices[i] supplies keys[i] in slice order.
+    // Source memory stays valid and unchanged until Wait returns.
+    virtual tl::expected<TaskHandle, ErrorCode> BatchPutAsync(
+        const std::vector<ObjectKey>& keys,
+        const std::vector<std::vector<Slice>>& batched_slices,
+        const TenantId& tenant_id) = 0;
+
+    // Write sources[i][j] at destination_offsets[i][j], relative to keys[i].
+    // Source memory has the same lifetime as BatchPutAsync.
+    virtual tl::expected<TaskHandle, ErrorCode> BatchPutRangesAsync(
+        const std::vector<ObjectKey>& keys,
+        const std::vector<std::vector<Slice>>& sources,
+        const std::vector<std::vector<size_t>>& destination_offsets,
+        const TenantId& tenant_id) = 0;
+
+    // Remove external objects independently of native replica leases.
+    virtual tl::expected<TaskHandle, ErrorCode> BatchRemoveAsync(
+        const std::vector<ObjectKey>& keys, const TenantId& tenant_id) = 0;
+
     /**
      * @brief Submits object existence queries.
      * @param keys Object keys to query.
