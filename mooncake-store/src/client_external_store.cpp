@@ -204,20 +204,24 @@ void Client::CompleteExternalPut(
 
 void Client::CompleteExternalRangePut(
     tl::expected<ExternalStoreTaskGuard, ErrorCode>& submission,
-    const std::vector<std::vector<Slice>>& slices,
-    std::vector<tl::expected<int64_t, ErrorCode>>& transfer) {
-    std::vector<tl::expected<void, ErrorCode>> statuses(transfer.size());
-    for (size_t i = 0; i < transfer.size(); ++i) {
-        if (!transfer[i]) statuses[i] = tl::unexpected(transfer[i].error());
-    }
-    CompleteExternalPut(submission, std::span(statuses));
-    for (size_t i = 0; i < transfer.size(); ++i) {
-        if (!transfer[i] && statuses[i]) {
-            // Count logical bytes once when only the external write
-            // succeeds.
-            int64_t bytes = 0;
-            for (const auto& slice : slices[i]) bytes += slice.size;
-            transfer[i] = bytes;
+    const std::vector<ObjectKey>& keys) {
+    if (!submission) {
+        LOG(WARNING) << "External range write submission failed, keys="
+                     << keys.size() << ", error=" << submission.error();
+    } else if (*submission) {
+        auto results = submission->Wait();
+        if (results.size() != keys.size()) {
+            LOG(ERROR)
+                << "External range write result count mismatch: expected="
+                << keys.size() << ", actual=" << results.size();
+            return;
+        }
+        for (size_t i = 0; i < results.size(); ++i) {
+            if (!results[i]) {
+                LOG(WARNING)
+                    << "External range write failed, key=" << keys[i]
+                    << ", index=" << i << ", error=" << results[i].error();
+            }
         }
     }
 }

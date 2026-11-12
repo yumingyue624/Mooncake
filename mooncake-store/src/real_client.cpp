@@ -8284,7 +8284,7 @@ std::vector<int> RealClient::batch_put_from_multi_buffer_ranges(
 
     auto transfer = client_->BatchTransferWriteRanges(replicas_per_entry,
                                                       slices, dst_offsets);
-    client_->CompleteExternalRangePut(external, slices, transfer);
+    client_->CompleteExternalRangePut(external, external_keys);
     for (size_t k = 0; k < transfer.size(); ++k) {
         results[idx_map[k]] = std::move(transfer[k]);
     }
