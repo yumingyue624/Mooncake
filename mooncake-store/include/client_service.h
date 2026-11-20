@@ -384,10 +384,9 @@ class Client {
      *
      * Accepted tasks are waited and consumed; empty guards leave native
      * results unchanged. Put succeeds per key if either storage path succeeds;
-     * otherwise the native error is preserved. Range writes retain native byte
-     * counts and errors so callers can decide whether to end or revoke a
-     * session. Remove logs external failures without changing native deletion
-     * results.
+     * otherwise the native error is preserved. Range writes return external
+     * status per key for the session to combine with the native result.
+     * Remove logs external failures without changing native deletion results.
      */
     void CompleteExternalRemove(
         tl::expected<ExternalStoreTaskGuard, ErrorCode>& submission);
@@ -397,7 +396,7 @@ class Client {
     void CompleteExternalPut(
         tl::expected<ExternalStoreTaskGuard, ErrorCode>& submission,
         std::span<tl::expected<void, ErrorCode>> native_results);
-    void CompleteExternalRangePut(
+    std::vector<tl::expected<void, ErrorCode>> CompleteExternalRangePut(
         tl::expected<ExternalStoreTaskGuard, ErrorCode>& submission,
         const std::vector<ObjectKey>& keys);
 

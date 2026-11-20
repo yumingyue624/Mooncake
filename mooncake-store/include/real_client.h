@@ -1253,6 +1253,7 @@ class RealClient : public PyClient {
         uint64_t object_size{0};
         ReplicaWriteMode write_mode{ReplicaWriteMode::SINGLE_REPLICA};
         bool writable{true};
+        bool external_only{false};
         size_t inflight_transfers{0};
     };
     struct ExternalReadSource {};
@@ -1261,9 +1262,14 @@ class RealClient : public PyClient {
     std::condition_variable session_cv_;
     std::unordered_map<std::string, GetSession> get_sessions_;
     std::unordered_map<std::string, PutSessionEntry> put_sessions_;
+    std::unordered_set<std::string> pending_put_starts_;
 
     void wait_session_put_idle(std::unique_lock<std::mutex> &lock,
                                const std::vector<std::string> &keys);
+    void close_external_put_sessions(
+        std::unique_lock<std::mutex> &lock,
+        const std::vector<std::string> &keys,
+        std::vector<tl::expected<void, ErrorCode>> &results);
 
     // Dummy VA -> real VA using mapped_shms; last_hit_shm caches locality.
     bool map_dummy_range_in_shm(const MappedShm &shm, uint64_t dummy_addr,

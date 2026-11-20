@@ -173,20 +173,24 @@ void Client::CompleteExternalPut(
     }
 }
 
-void Client::CompleteExternalRangePut(
+std::vector<tl::expected<void, ErrorCode>> Client::CompleteExternalRangePut(
     tl::expected<ExternalStoreTaskGuard, ErrorCode>& submission,
     const std::vector<ObjectKey>& keys) {
     if (!submission) {
         LOG(WARNING) << "External range write submission failed, keys="
                      << keys.size() << ", error=" << submission.error();
-    } else if (*submission) {
+        return std::vector<tl::expected<void, ErrorCode>>(
+            keys.size(), tl::unexpected(submission.error()));
+    }
+    if (*submission) {
         ExternalStoreBackend::TaskOutput output;
         auto results = submission->Wait(output);
         if (results.size() != keys.size()) {
             LOG(ERROR)
                 << "External range write result count mismatch: expected="
                 << keys.size() << ", actual=" << results.size();
-            return;
+            return std::vector<tl::expected<void, ErrorCode>>(
+                keys.size(), tl::unexpected(ErrorCode::RPC_FAIL));
         }
         for (size_t i = 0; i < results.size(); ++i) {
             if (!results[i]) {
@@ -195,7 +199,10 @@ void Client::CompleteExternalRangePut(
                     << ", index=" << i << ", error=" << results[i].error();
             }
         }
+        return results;
     }
+    return std::vector<tl::expected<void, ErrorCode>>(
+        keys.size(), tl::unexpected(ErrorCode::NOT_SUPPORTED));
 }
 
 // Drain external deletes for diagnostics; callers return the native result.

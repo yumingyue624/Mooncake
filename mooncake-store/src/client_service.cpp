@@ -3810,12 +3810,31 @@ Client::StartBatchPutForSizes(const std::vector<std::string>& keys,
     std::vector<PutOperation> ops = CreatePutOperations(keys, batched_slices);
     StartBatchPut(ops, client_cfg);
 
+    std::vector<std::string> failed_keys;
     for (size_t i = 0; i < ops.size(); ++i) {
         if (ops[i].IsResolved()) {
+            if (!ops[i].replicas.empty()) {
+                failed_keys.push_back(ops[i].key);
+            }
             results[i] = tl::unexpected(ops[i].result.error());
             continue;
         }
         results[i] = std::move(ops[i].replicas);
+    }
+    if (!failed_keys.empty()) {
+        const auto revoked = BatchPutRevoke(failed_keys, ReplicaType::ALL);
+        if (revoked.size() != failed_keys.size()) {
+            LOG(WARNING) << "Failed to revoke incomplete session allocations";
+        } else {
+            for (size_t i = 0; i < revoked.size(); ++i) {
+                if (!revoked[i] &&
+                    revoked[i].error() != ErrorCode::OBJECT_NOT_FOUND) {
+                    LOG(WARNING)
+                        << "Failed to revoke session allocation for "
+                        << failed_keys[i] << ": " << revoked[i].error();
+                }
+            }
+        }
     }
     return results;
 }

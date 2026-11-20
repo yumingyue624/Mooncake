@@ -8143,13 +8143,22 @@ std::vector<int> RealClient::batch_put_session_start(
             keys.size(), static_cast<int>(toInt(ErrorCode::INVALID_PARAMS)));
     }
 
+    if (config.replica_num == 0) {
+        return std::vector<int>(keys.size(), toInt(ErrorCode::INVALID_PARAMS));
+    }
+
     std::vector<std::string> start_keys;
     std::vector<uint64_t> start_sizes;
     std::vector<size_t> start_indices;
     {
         std::lock_guard<std::mutex> lock(session_mutex_);
         for (size_t i = 0; i < keys.size(); ++i) {
-            if (put_sessions_.count(keys[i]) != 0) {
+            if (keys[i].empty() || sizes[i] == 0) {
+                results[i] = toInt(ErrorCode::INVALID_PARAMS);
+                continue;
+            }
+            if (put_sessions_.count(keys[i]) != 0 ||
+                !pending_put_starts_.insert(keys[i]).second) {
                 LOG(ERROR) << "Put session already exists for key: " << keys[i];
                 results[i] = static_cast<int>(toInt(ErrorCode::INVALID_PARAMS));
                 continue;
@@ -8167,44 +8176,48 @@ std::vector<int> RealClient::batch_put_session_start(
 
     auto start_responses =
         client_->StartBatchPutForSizes(start_keys, start_sizes, start_config);
+    const bool external_enabled = client_->HasExternalStoreBackend();
     std::vector<std::string> keys_to_revoke;
-    std::vector<std::string> hot_keys_to_remove;
+    std::vector<bool> has_memory(start_keys.size(), false);
+    for (size_t j = 0; j < start_keys.size(); ++j) {
+        if (!start_responses[j]) continue;
+        const auto &replicas = *start_responses[j];
+        has_memory[j] = std::any_of(
+            replicas.begin(), replicas.end(),
+            [](const auto &replica) { return replica.is_memory_replica(); });
+        if (!has_memory[j] && !replicas.empty()) {
+            keys_to_revoke.push_back(start_keys[j]);
+        }
+    }
+    if (!keys_to_revoke.empty()) {
+        if (client_->GetHotCache()) {
+            client_->GetHotCache()->RemoveHotKeys(keys_to_revoke);
+        }
+        (void)client_->BatchPutRevoke(keys_to_revoke);
+    }
     {
         std::lock_guard<std::mutex> lock(session_mutex_);
         for (size_t j = 0; j < start_keys.size(); ++j) {
             const size_t i = start_indices[j];
-            if (!start_responses[j]) {
-                results[i] =
-                    static_cast<int>(toInt(start_responses[j].error()));
+            auto &native = start_responses[j];
+            const auto error =
+                native ? ErrorCode::INVALID_REPLICA : native.error();
+            pending_put_starts_.erase(keys[i]);
+            if (!has_memory[j] && !external_enabled) {
+                results[i] = toInt(error);
                 continue;
             }
-            auto replicas = std::move(start_responses[j].value());
-            bool has_memory_replica = false;
-            for (const auto &replica : replicas) {
-                if (replica.is_memory_replica()) {
-                    has_memory_replica = true;
-                    break;
-                }
-            }
-            if (!has_memory_replica) {
-                hot_keys_to_remove.push_back(keys[i]);
-                keys_to_revoke.push_back(keys[i]);
-                results[i] =
-                    static_cast<int>(toInt(ErrorCode::INVALID_REPLICA));
-                continue;
-            }
-            put_sessions_[keys[i]] = PutSessionEntry{
-                .replicas = std::move(replicas),
-                .object_size = static_cast<uint64_t>(sizes[i]),
-                .write_mode = write_mode,
-            };
+            put_sessions_.emplace(
+                keys[i],
+                PutSessionEntry{
+                    .replicas = has_memory[j]
+                                    ? std::move(*native)
+                                    : std::vector<Replica::Descriptor>{},
+                    .object_size = sizes[i],
+                    .write_mode = write_mode,
+                    .external_only = !has_memory[j],
+                });
         }
-    }
-    if (client_->GetHotCache() && !hot_keys_to_remove.empty()) {
-        client_->GetHotCache()->RemoveHotKeys(hot_keys_to_remove);
-    }
-    if (!keys_to_revoke.empty()) {
-        (void)client_->BatchPutRevoke(keys_to_revoke);
     }
     return results;
 }
@@ -8304,13 +8317,55 @@ std::vector<int> RealClient::batch_put_from_multi_buffer_ranges(
     auto external = client_->BatchPutExternalRangesAsync(external_keys, slices,
                                                          external_offsets);
 
-    auto transfer = client_->BatchTransferWriteRanges(replicas_per_entry,
-                                                      slices, dst_offsets);
-    client_->CompleteExternalRangePut(external, external_keys);
-    for (size_t k = 0; k < transfer.size(); ++k) {
-        results[idx_map[k]] = std::move(transfer[k]);
+    std::vector<tl::expected<int64_t, ErrorCode>> transfer;
+    if (std::any_of(replicas_per_entry.begin(), replicas_per_entry.end(),
+                    [](const auto &replicas) { return !replicas.empty(); })) {
+        transfer = client_->BatchTransferWriteRanges(replicas_per_entry, slices,
+                                                     dst_offsets);
+    }
+    auto external_results =
+        client_->CompleteExternalRangePut(external, external_keys);
+    for (size_t k = 0; k < idx_map.size(); ++k) {
+        auto &result = results[idx_map[k]];
+        if (!replicas_per_entry[k].empty()) {
+            result = std::move(transfer[k]);
+            continue;
+        }
+        if (!external_results[k]) {
+            result = tl::unexpected(external_results[k].error());
+            continue;
+        }
+        int64_t bytes = 0;
+        for (const auto &slice : slices[k]) {
+            bytes += static_cast<int64_t>(slice.size);
+        }
+        result = bytes;
     }
     return ToPyResults(results);
+}
+
+void RealClient::close_external_put_sessions(
+    std::unique_lock<std::mutex> &lock, const std::vector<std::string> &keys,
+    std::vector<tl::expected<void, ErrorCode>> &results) {
+    if (!client_->HasExternalStoreBackend()) return;
+
+    std::vector<std::string> external_keys;
+    std::vector<size_t> external_indices;
+    for (size_t i = 0; i < keys.size(); ++i) {
+        auto it = put_sessions_.find(keys[i]);
+        if (it == put_sessions_.end() || !it->second.external_only ||
+            !it->second.writable) {
+            continue;
+        }
+        it->second.writable = false;
+        external_keys.push_back(keys[i]);
+        external_indices.push_back(i);
+    }
+    wait_session_put_idle(lock, external_keys);
+    for (size_t i : external_indices) {
+        put_sessions_.erase(keys[i]);
+        results[i] = {};
+    }
 }
 
 std::vector<int> RealClient::batch_put_session_end(
@@ -8327,10 +8382,10 @@ std::vector<int> RealClient::batch_put_session_end(
     std::vector<char> has_nof;
     {
         std::unique_lock<std::mutex> lock(session_mutex_);
+        close_external_put_sessions(lock, keys, results);
         for (size_t i = 0; i < keys.size(); ++i) {
             auto it = put_sessions_.find(keys[i]);
-            if (it == put_sessions_.end()) {
-                results[i] = tl::unexpected(ErrorCode::INVALID_PARAMS);
+            if (it == put_sessions_.end() || it->second.external_only) {
                 continue;
             }
             bool nof = false;
@@ -8440,10 +8495,10 @@ std::vector<int> RealClient::batch_put_session_revoke(
     std::vector<size_t> revoke_indices;
     {
         std::unique_lock<std::mutex> lock(session_mutex_);
+        close_external_put_sessions(lock, keys, results);
         for (size_t i = 0; i < keys.size(); ++i) {
             auto it = put_sessions_.find(keys[i]);
-            if (it == put_sessions_.end()) {
-                results[i] = tl::unexpected(ErrorCode::INVALID_PARAMS);
+            if (it == put_sessions_.end() || it->second.external_only) {
                 continue;
             }
             it->second.writable = false;
