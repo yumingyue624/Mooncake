@@ -106,4 +106,121 @@ std::vector<tl::expected<bool, ErrorCode>> Client::BatchExistsExternal(
     return results;
 }
 
+tl::expected<ExternalStoreTaskGuard, ErrorCode> Client::BatchPutExternalAsync(
+    const std::vector<ObjectKey>& keys,
+    const std::vector<std::vector<Slice>>& sources) {
+    if (keys.empty() || !external_store_backend_)
+        return ExternalStoreTaskGuard{};
+    auto submitted = external_store_backend_->BatchPutAsync(keys, sources);
+    if (!submitted) return tl::unexpected(submitted.error());
+    return ExternalStoreTaskGuard(external_store_backend_.get(), *submitted);
+}
+
+tl::expected<ExternalStoreTaskGuard, ErrorCode>
+Client::BatchPutExternalRangesAsync(
+    const std::vector<ObjectKey>& keys,
+    const std::vector<std::vector<Slice>>& sources,
+    const std::vector<std::vector<size_t>>& destination_offsets) {
+    if (keys.empty() || !external_store_backend_)
+        return ExternalStoreTaskGuard{};
+    auto submitted = external_store_backend_->BatchPutRangesAsync(
+        keys, sources, destination_offsets);
+    if (!submitted) return tl::unexpected(submitted.error());
+    return ExternalStoreTaskGuard(external_store_backend_.get(), *submitted);
+}
+
+tl::expected<ExternalStoreTaskGuard, ErrorCode>
+Client::BatchRemoveExternalAsync(const std::vector<ObjectKey>& keys) {
+    if (keys.empty() || !external_store_backend_)
+        return ExternalStoreTaskGuard{};
+    auto submitted = external_store_backend_->BatchRemoveAsync(keys);
+    if (!submitted) return tl::unexpected(submitted.error());
+    return ExternalStoreTaskGuard(external_store_backend_.get(), *submitted);
+}
+
+tl::expected<void, ErrorCode> Client::CompleteExternalPut(
+    tl::expected<ExternalStoreTaskGuard, ErrorCode>& submission,
+    tl::expected<void, ErrorCode> native_result) {
+    CompleteExternalPut(submission, std::span(&native_result, 1));
+    return native_result;
+}
+
+// A key succeeds if either storage path succeeds; always wait for submitted
+// work.
+void Client::CompleteExternalPut(
+    tl::expected<ExternalStoreTaskGuard, ErrorCode>& submission,
+    std::span<tl::expected<void, ErrorCode>> native_results) {
+    if (!submission) {
+        LOG(WARNING) << "External store submission failed: "
+                     << submission.error();
+        return;
+    }
+    if (!*submission) return;
+    ExternalStoreBackend::TaskOutput output;
+    auto external = submission->Wait(output);
+    if (external.size() != native_results.size()) {
+        LOG(ERROR) << "External store result count mismatch: expected="
+                   << native_results.size() << ", actual=" << external.size();
+        return;
+    }
+    for (size_t i = 0; i < external.size(); ++i) {
+        if (!external[i]) {
+            LOG(WARNING) << "External store operation failed at index=" << i
+                         << ": " << external[i].error();
+        } else {
+            native_results[i] = {};
+        }
+    }
+}
+
+std::vector<tl::expected<void, ErrorCode>> Client::CompleteExternalRangePut(
+    tl::expected<ExternalStoreTaskGuard, ErrorCode>& submission,
+    const std::vector<ObjectKey>& keys) {
+    if (!submission) {
+        LOG(WARNING) << "External range write submission failed, keys="
+                     << keys.size() << ", error=" << submission.error();
+        return std::vector<tl::expected<void, ErrorCode>>(
+            keys.size(), tl::unexpected(submission.error()));
+    }
+    if (*submission) {
+        ExternalStoreBackend::TaskOutput output;
+        auto results = submission->Wait(output);
+        if (results.size() != keys.size()) {
+            LOG(ERROR)
+                << "External range write result count mismatch: expected="
+                << keys.size() << ", actual=" << results.size();
+            return std::vector<tl::expected<void, ErrorCode>>(
+                keys.size(), tl::unexpected(ErrorCode::RPC_FAIL));
+        }
+        for (size_t i = 0; i < results.size(); ++i) {
+            if (!results[i]) {
+                LOG(WARNING)
+                    << "External range write failed, key=" << keys[i]
+                    << ", index=" << i << ", error=" << results[i].error();
+            }
+        }
+        return results;
+    }
+    return std::vector<tl::expected<void, ErrorCode>>(
+        keys.size(), tl::unexpected(ErrorCode::NOT_SUPPORTED));
+}
+
+// Drain external deletes for diagnostics; callers return the native result.
+void Client::CompleteExternalRemove(
+    tl::expected<ExternalStoreTaskGuard, ErrorCode>& submission) {
+    if (!submission) {
+        LOG(WARNING) << "External delete submission failed: "
+                     << submission.error();
+    } else if (*submission) {
+        ExternalStoreBackend::TaskOutput output;
+        auto results = submission->Wait(output);
+        for (size_t i = 0; i < results.size(); ++i) {
+            if (!results[i]) {
+                LOG(WARNING) << "External delete failed at index=" << i << ": "
+                             << results[i].error();
+            }
+        }
+    }
+}
+
 }  // namespace mooncake

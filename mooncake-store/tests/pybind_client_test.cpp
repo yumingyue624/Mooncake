@@ -2025,6 +2025,16 @@ TEST_F(RealClientTest, TestPutGetSessionAbnormal) {
         EXPECT_EQ(py_client_->batch_put_session_revoke(keys)[0], 0);
     }
 
+    // --- Put: duplicate key within a batch ---
+    {
+        const std::string key = "dup_put_batch";
+        EXPECT_EQ(py_client_->batch_put_session_start(
+                      {key, key}, {kObjectSize, kObjectSize}),
+                  (std::vector<int>{0, kInvalidParams}));
+        EXPECT_EQ(py_client_->batch_put_session_revoke({key}),
+                  std::vector<int>{0});
+    }
+
     // --- Put: range overflow past object_size ---
     {
         std::vector<std::string> keys = {"overflow_put"};
