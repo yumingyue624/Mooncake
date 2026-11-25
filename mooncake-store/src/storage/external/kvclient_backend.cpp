@@ -101,14 +101,19 @@ tl::expected<void, ErrorCode> KvClientBackend::RegisterMemory(
                                      .device_id = -1};
     auto runtime = device::GetAcceleratorRegistry().RuntimeAccelerators();
     runtime.FindDeviceForPointer(addr, &pointer_info);
-    // ASU supports device memory for business data.
-    if (pointer_info.kind != device::MemoryKind::kDevice) return {};
+    if (pointer_info.kind != device::MemoryKind::kHost &&
+        pointer_info.kind != device::MemoryKind::kDevice) {
+        return {};
+    }
+    const bool is_device = pointer_info.kind == device::MemoryKind::kDevice;
+
     std::unique_lock lock(memory_mutex_);
     kv::MemoryRegion region;
-    region.memoryType = kv::MemoryType::DEVICE;
+    region.memoryType =
+        is_device ? kv::MemoryType::DEVICE : kv::MemoryType::HOST;
     region.addr = reinterpret_cast<uintptr_t>(addr);
     region.size = length;
-    region.deviceId = pointer_info.device_id;
+    region.deviceId = is_device ? pointer_info.device_id : -1;
     if (regions_.find(region.addr) != regions_.end()) {
         LOG(WARNING) << "KVClient memory is already registered, addr=" << addr
                      << ", size=" << length << ", device=" << region.deviceId;
@@ -122,6 +127,9 @@ tl::expected<void, ErrorCode> KvClientBackend::RegisterMemory(
                    << ", status=" << static_cast<int>(status.code)
                    << ", error=" << status.message;
         return tl::unexpected(ToError(status));
+    }
+    if (registered.empty()) {
+        return tl::unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     }
     regions_.emplace(region.addr, registered.front());
     return {};
@@ -361,8 +369,6 @@ KvClientBackend::FindRegisteredMemory(const Slice& slice) const {
     if (offset > registered.region.size || slice.size == 0 ||
         slice.size > registered.region.size - offset)
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
-    if (registered.region.memoryType != kv::MemoryType::DEVICE)
-        return tl::unexpected(ErrorCode::NOT_SUPPORTED);
     return &registered;
 }
 
